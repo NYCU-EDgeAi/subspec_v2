@@ -24,6 +24,7 @@ def run_depth_analysis_on_dataset(
     max_depth,
     args,
     log_dir,
+    save_samples: bool = True,
 ):
     """
     Run depth analysis on a dataset, collecting acceptance length statistics.
@@ -44,10 +45,14 @@ def run_depth_analysis_on_dataset(
     all_acceptance_lengths = []
     prompt_sample_counts = []  # Track samples per prompt (compact)
     
+    # Detailed sample logs for comparison with benchmark
+    sample_logs = []
+    
     pbar = tqdm(dataset, desc="Depth Analysis")
     for prompt_idx, item in enumerate(pbar):
         prompt = extract_prompt(item)
         prompt_samples = 0  # Count samples for this prompt
+        prompt_acceptance_lengths = []  # Track acceptance per iteration for this prompt
         
         # Tokenize
         messages = [{"role": "user", "content": prompt}]
@@ -56,10 +61,21 @@ def run_depth_analysis_on_dataset(
         input_ids = tokenizer(input_text, return_tensors="pt").input_ids.to(device)
         _, org_input_len = input_ids.shape
         
+        logging.debug(f"[Prompt {prompt_idx}] Input length: {org_input_len} tokens")
+        logging.debug(f"[Prompt {prompt_idx}] Prompt: {prompt[:200]}{'...' if len(prompt) > 200 else ''}")
+        
         # Skip if too long
         if input_ids.shape[1] > args.max_length:
             logging.info(f"Skipping prompt {prompt_idx} due to length {input_ids.shape[1]} > {args.max_length}")
             prompt_sample_counts.append(0)
+            if save_samples:
+                sample_logs.append({
+                    "prompt_idx": prompt_idx,
+                    "prompt": prompt,
+                    "input_len": int(org_input_len),
+                    "skipped": True,
+                    "skip_reason": "too_long",
+                })
             continue
         
         # Reset cache
@@ -109,6 +125,7 @@ def run_depth_analysis_on_dataset(
                     tree, root_ind=0, logits=outputs.logits, logits_processor=logits_processor, do_sample=False
                 )
                 all_acceptance_lengths.append(accept_len)
+                prompt_acceptance_lengths.append(accept_len)
                 prompt_samples += 1
                 
                 target_token = sampled_tokens[0:1, 0:1].to(device)
@@ -121,9 +138,11 @@ def run_depth_analysis_on_dataset(
                 del outputs
                 
                 # Reorder KV cache and add single token
-                past_kv.reorder_cache_with_offset(hidden_indices[:1], offset=prev_kv_len,
-                                                  new_chunk_len=generator.draft_params.max_verify_tokens, dim=2)
+                # past_kv.reorder_cache_with_offset(hidden_indices[:1], offset=prev_kv_len,                               new_chunk_len=generator.draft_params.max_verify_tokens, dim=2)
+                
+                # crop to seq_len + 1
                 past_kv.seq_len += 1
+                past_kv.crop(past_kv.seq_len, past_kv.seq_len+max_depth, dim=2)
                 
                 # Update cache_position for next iteration
                 cache_position = cache_position + 1
@@ -134,9 +153,30 @@ def run_depth_analysis_on_dataset(
                 if target_token.item() == tokenizer.eos_token_id:
                     break
                 if tokenizer.eos_token_id in sampled_tokens:
+                    # append al sampled_tokens to generated_token_ids
+                    generated_token_ids.extend(sampled_tokens[0, 1:].tolist())
                     break
         
         prompt_sample_counts.append(prompt_samples)
+        
+        # Decode generated text and log
+        generated_text = tokenizer.decode(generated_token_ids, skip_special_tokens=False)
+        logging.debug(f"[Prompt {prompt_idx}] Generated {len(generated_token_ids)} tokens: "
+                      f"'{generated_text[:300]}{'...' if len(generated_text) > 300 else ''}'")
+        
+        # Save detailed sample info
+        if save_samples:
+            sample_logs.append({
+                "prompt_idx": prompt_idx,
+                "query": prompt,
+                "input_len": int(org_input_len),
+                "skipped": False,
+                "n_tokens": len(generated_token_ids),
+                "n_iterations": prompt_samples,
+                "acceptance_lengths": prompt_acceptance_lengths,
+                "mean_acceptance": float(np.mean(prompt_acceptance_lengths)) if prompt_acceptance_lengths else 0.0,
+                "response": generated_text,
+            })
         
         # Log progress
         logging.debug(f"Prompt {prompt_idx + 1}: {prompt_samples} samples, "
@@ -171,6 +211,35 @@ def run_depth_analysis_on_dataset(
     # Save numpy arrays
     np.save(os.path.join(log_dir, "acc_arr.npy"), acc_arr)
     np.save(os.path.join(log_dir, "prompt_sample_counts.npy"), prompt_counts)
+    
+    # Save logs in run_benchmark style: one JSON object per line, compact arrays, minimal fields
+    if save_samples and sample_logs:
+        log_file = os.path.join(log_dir, "0.jsonl")
+        for i, sample in enumerate(sample_logs):
+            exp_log = {
+                "query": sample["query"],
+                "response": sample["response"],
+                "n_tokens": sample["n_tokens"],
+                "n_iterations": sample["n_iterations"],
+                "acceptance_lengths": sample["acceptance_lengths"],
+                "mean_acceptance": sample["mean_acceptance"],
+            }
+            with open(log_file, 'a+') as f:
+                # Dump with compact separators for arrays
+                json.dump(exp_log, f, indent=4)
+                f.write("\n")
+        # Add overall summary as last line
+        overall_log = {
+            "overall": True,
+            "n_prompts": len(sample_logs),
+            "n_samples": int(np.sum([s["n_iterations"] for s in sample_logs])),
+            "mean_acceptance": float(np.mean([s["mean_acceptance"] for s in sample_logs])) if sample_logs else 0.0,
+            "mean_n_tokens": float(np.mean([s["n_tokens"] for s in sample_logs])) if sample_logs else 0.0,
+        }
+        with open(log_file, 'a+') as f:
+            json.dump(overall_log, f, indent=4)
+            f.write("\n")
+        logging.info(f"Saved {len(sample_logs)} sample logs to {log_file}")
     
     # Build results summary
     results = {
