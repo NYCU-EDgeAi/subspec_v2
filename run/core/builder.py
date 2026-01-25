@@ -284,10 +284,12 @@ class GeneratorPipelineBuilder:
             )
 
         logging.info(f"Compiling generator with mode: {self.compile_mode}")
-        
+
         # FlashInfer methods generally require fullgraph=False to work.
+        # Match _fi, _fi2, _fi3, etc. patterns
         method_name = str(getattr(self.config, "method", ""))
-        fullgraph = not method_name.endswith("_fi")
+        is_flashinfer_method = "_fi" in method_name
+        fullgraph = not is_flashinfer_method
         
         # If the target model uses offloading, torch.compile() (especially fullgraph/cudagraph-related paths)
         # is typically incompatible or provides little benefit. Skip compiling target_model in that case.
