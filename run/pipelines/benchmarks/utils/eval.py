@@ -25,7 +25,7 @@ def run_common_eval(generator, tokenizer, past_key_values, draft_past_key_values
             enable_thinking=True # for Qwen 3 models
         ).cuda(device=args.device)
         torch.cuda.empty_cache()
-        with sdpa_kernel(backends=[SDPBackend.MATH]):
+        with sdpa_kernel(backends=[SDPBackend.CUDNN_ATTENTION]):
             gc.collect()
             torch.cuda.empty_cache()
             generator.generate(input_ids, temperature=args.temperature, max_length=args.max_length, do_sample=args.do_sample, past_key_values=past_key_values, draft_past_key_values=draft_past_key_values)
@@ -52,7 +52,7 @@ def run_common_eval(generator, tokenizer, past_key_values, draft_past_key_values
             logging.info(f"Skipping query No.{idx} due to length {input_ids.shape[1]} > {args.max_length}")
             continue
         
-        with sdpa_kernel(backends=[SDPBackend.MATH]):
+        with sdpa_kernel(backends=[SDPBackend.CUDNN_ATTENTION]):
             output_ids = generator.generate(
                 input_ids,
                 temperature=args.temperature,
@@ -124,7 +124,7 @@ def run_mtbench_eval(generator, tokenizer, past_key_values, draft_past_key_value
         tokenizer.use_default_system_prompt = True
         input_ids = tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True, return_tensors="pt").cuda(device=args.device)
         
-        with sdpa_kernel(backends=[SDPBackend.MATH]):
+        with sdpa_kernel(backends=[SDPBackend.CUDNN_ATTENTION]):
             gc.collect()
             torch.cuda.empty_cache()
             generator.generate(input_ids, temperature=args.temperature, max_length=args.max_length, do_sample=args.do_sample, past_key_values=past_key_values, draft_past_key_values=draft_past_key_values)
@@ -167,7 +167,7 @@ def run_mtbench_eval(generator, tokenizer, past_key_values, draft_past_key_value
                 logging.info(f"Skipping query No.{idx} (turn {tid}) due to length {input_ids.shape[1]} > {args.max_length}")
                 continue
             
-            with sdpa_kernel(backends=[SDPBackend.MATH]):
+            with sdpa_kernel(backends=[SDPBackend.CUDNN_ATTENTION]):
                 output_ids = generator.generate(input_ids, temperature=args.temperature, max_length=args.max_length, do_sample=args.do_sample, past_key_values=past_key_values, draft_past_key_values=draft_past_key_values)
             
             output_message = tokenizer.decode(output_ids[0][input_ids.shape[1]:])
