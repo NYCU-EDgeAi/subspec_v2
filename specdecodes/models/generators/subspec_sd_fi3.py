@@ -14,15 +14,15 @@ import nvtx
 from .classic_sd import ClassicSDGeneratorBase
 from ..utils.mixin import SDProfilingMixin
 # Test: Use v1's flashinfer modules instead of v3's
-from ..utils.flashinfer.cache_manager import (
+from ..utils.flashinfer_v3.cache_manager import (
     KvCachePool,
     KvCacheBatchPosition,
     RequestKvCache,
     getKvCacheBatchPosition,
     FlashInferCache
 )
-from ..utils.flashinfer.attention_wrapper import FlashinferAttentionWrapper
-from ..utils.flashinfer.prefill import flashinfer_chunked_prefill
+from ..utils.flashinfer_v3.attention_wrapper import FlashinferAttentionWrapper
+from ..utils.flashinfer_v3.prefill import flashinfer_chunked_prefill
 
 
 class SubSpecSDGeneratorBase(ClassicSDGeneratorBase):

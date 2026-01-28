@@ -9,12 +9,12 @@ from copy import deepcopy
 
 from ..utils.cpu_tree import Tree
 from .base import DraftModelBase, TreeData, TreeMaskCache
-from ..utils.flashinfer.cache_manager import (
+from ..utils.flashinfer_v3.cache_manager import (
     RequestKvCache,
     KvCacheBatchPosition,
     getKvCacheBatchPosition,
 )
-from ..utils.flashinfer.attention_wrapper import FlashinferAttentionWrapper
+from ..utils.flashinfer_v3.attention_wrapper import FlashinferAttentionWrapper
 
 
 def _share_param_deepcopy(model):
