@@ -1,3 +1,5 @@
+# Evaluation follows LMSYS MT-Bench (FastChat question set).
+# https://github.com/lm-sys/FastChat
 import json
 
 QUERY_TEMPLATE = """

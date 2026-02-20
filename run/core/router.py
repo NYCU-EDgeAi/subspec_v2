@@ -61,14 +61,21 @@ def run_app(builder):
         main_run_benchmark(builder, benchmarks=benchmarks, max_samples=max_samples)
         
     @app.command()
-    def run_benchmark_acc(benchmarks: str = None, max_samples: int = None):
+    def run_benchmark_acc(
+        benchmarks: str = None,
+        max_samples: int = None,
+        lane: str = typer.Option(
+            None,
+            help="Evaluation lane: distribution (LL-based) or behavior (generation-based)",
+        ),
+    ):
         """
         Example subcommand for benchmarking.
         Usage: 
             python custom.py run-benchmark --bench-name=mt-bench
         """
         from run.pipelines.run_benchmark_acc import main as main_run_benchmark_acc
-        main_run_benchmark_acc(builder, benchmarks=benchmarks, max_samples=max_samples)
+        main_run_benchmark_acc(builder, benchmarks=benchmarks, max_samples=max_samples, lane=lane)
 
     @app.command()
     def run_benchmark_agent(benchmarks: str = None, max_samples: int = None):
@@ -79,6 +86,45 @@ def run_app(builder):
         """
         from run.pipelines.run_benchmark_agent import main as main_run_benchmark_agent
         main_run_benchmark_agent(builder, benchmarks=benchmarks, max_samples=max_samples)
+
+    @app.command()
+    def run_benchmark_compare(
+        benchmarks: str = None,
+        max_samples: int = None,
+        compare_config: str = typer.Option(..., help="YAML config path for the compare model/method"),
+        compare_name: str = typer.Option("compare", help="Label for the compare run"),
+        seed: int = typer.Option(0, help="Shuffle seed for paired sampling"),
+        shuffle: bool = typer.Option(True, help="Shuffle dataset before sampling"),
+        token_kl: bool = typer.Option(
+            True,
+            "--token-kl/--no-token-kl",
+            help="Compute token-level KL for multiple-choice benchmarks",
+        ),
+        lane: str = typer.Option(
+            "distribution",
+            help="Evaluation lane: distribution (LL-based) or behavior (generation-based)",
+        ),
+        reuse_baseline_dir: str = typer.Option(
+            None,
+            help="Reuse baseline logs from a prior run-benchmark-compare directory",
+        ),
+    ):
+        """
+        Paired benchmark comparison (flips + KL metrics).
+        """
+        from run.pipelines.run_benchmark_compare import main as main_run_benchmark_compare
+        main_run_benchmark_compare(
+            builder,
+            benchmarks=benchmarks,
+            max_samples=max_samples,
+            compare_config=compare_config,
+            compare_name=compare_name,
+            seed=seed,
+            shuffle=shuffle,
+            token_kl=token_kl,
+            lane=lane,
+            reuse_baseline_dir=reuse_baseline_dir,
+        )
 
     @app.command()
     def run_depth_analysis(

@@ -11,7 +11,7 @@ if TYPE_CHECKING:
     from .core.configuration import AppConfig
 
 
-BENCHMARK_COMMANDS = {"run-benchmark", "run-benchmark-acc", "run-benchmark-agent"}
+BENCHMARK_COMMANDS = {"run-benchmark", "run-benchmark-acc", "run-benchmark-agent", "run-benchmark-compare"}
 
 
 def _configure_allocator_env(default: str = "expandable_segments:True") -> None:

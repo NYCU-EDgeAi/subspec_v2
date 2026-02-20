@@ -12,7 +12,12 @@ from torch.nn.attention import SDPBackend, sdpa_kernel
 from transformers import LogitsProcessorList
 
 from .benchmarks.registry import load_dataset, validate_benchmarks, extract_prompt
-from .utils.benchmark_utils import reset_seeds, cleanup_gpu, setup_benchmark_dir
+from .utils.benchmark_utils import (
+    cleanup_gpu,
+    parse_benchmark_list,
+    reset_seeds,
+    setup_benchmark_dir,
+)
 from .utils.eval_utils import reset_kv
 
 
@@ -288,7 +293,7 @@ def main(builder, benchmarks=None, max_samples=None):
     max_depth = generator.draft_params.max_depth
     
     # Validate benchmarks
-    bench_list = benchmarks.split(",") if benchmarks is not None else []
+    bench_list = parse_benchmark_list(benchmarks)
     validate_benchmarks(bench_list)
     
     print(f"Benchmarks to analyze: {bench_list}")

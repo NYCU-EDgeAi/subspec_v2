@@ -1,68 +1,81 @@
-import random
+# Evaluation follows TIGER-AI-Lab/MMLU-Pro (evaluate_from_local.py + initial_prompt.txt).
+# https://github.com/TIGER-AI-Lab/MMLU-Pro
 from datasets import load_dataset
 
-# Keep the same fluent QUERY_TEMPLATE as before
-QUERY_TEMPLATE = """
-Provide your step-by-step reasoning. On the last line by itself, give the final answer in the format "Answer: <LETTER>".
-Question: {question}
-Options:
-{options}
+DATASET_PATH = "TIGER-Lab/MMLU-Pro"
+DATASET_REVISION = "527feea0afed1de15a8c115abf7be4c912123315"
 
-Answer:
-""".strip()
+CHOICES = ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P"]
+INITIAL_PROMPT = (
+    "The following are multiple choice questions (with answers) about {$}. "
+    "Think step by step and then finish your answer with \"the answer is (X)\" where X "
+    "is the correct letter choice.\n\n"
+)
 
-def load_mmlu_pro_dataset(sample_per_category: int = 20, seed: int = 0):
-    """
-    Returns a list of formatted MMLU‑Pro prompts, sampling up to `sample_per_category`
-    examples from each category.
-    """
-    ds = load_dataset("TIGER-Lab/MMLU-Pro", split="test")
-    # group by category
-    by_cat = {}
-    for ex in ds:
-        cat = ex["category"]
-        by_cat.setdefault(cat, []).append(ex)
-    # reproducible sampling
-    rng = random.Random(seed)
-    prompts = []
-    for cat, examples in by_cat.items():
-        picks = rng.sample(examples, min(sample_per_category, len(examples)))
-        for ex in picks:
-            opts = ex["options"]
-            options_str = "\n".join(
-                f"({chr(ord('A')+i)}) {opt}"
-                for i, opt in enumerate(opts)
-            )
-            prompt = QUERY_TEMPLATE.format(
-                question=ex["question"],
-                options=options_str
-            )
-            prompts.append(prompt)
-    return prompts
 
-def load_mmlu_pro_dataset_answer(sample_per_category: int = 20, seed: int = 42):
-    """
-    Returns a list of dicts {"question": prompt, "answer": <"A"–"J">},
-    sampling up to `sample_per_category` examples per category.
-    """
-    ds = load_dataset("TIGER-Lab/MMLU-Pro", split="test")
-    by_cat = {}
-    for ex in ds:
-        by_cat.setdefault(ex["category"], []).append(ex)
-    rng = random.Random(seed)
+def _preprocess(dataset):
+    res = []
+    for each in dataset:
+        options = [opt for opt in each["options"] if opt != "N/A"]
+        item = dict(each)
+        item["options"] = options
+        res.append(item)
+    return res
+
+
+def _select_by_category(dataset, subject):
+    return [each for each in dataset if each["category"] == subject]
+
+
+def format_cot_example(example, including_answer=True):
+    prompt = "Question:\n"
+    prompt += example["question"] + "\n"
+    prompt += "Options:\n"
+    for i, opt in enumerate(example["options"]):
+        prompt += "{}. {}\n".format(CHOICES[i], opt)
+    if including_answer:
+        cot_content = example["cot_content"].replace(
+            "A: Let's think step by step.",
+            "Answer: Let's think step by step.",
+        )
+        prompt += cot_content + "\n\n"
+    else:
+        prompt += "Answer: Let's think step by step."
+    return prompt
+
+
+def generate_cot_prompt(val_df, curr, k):
+    subject = curr["category"]
+    prompt = INITIAL_PROMPT.replace("{$}", subject) + "\n"
+    val_df = _select_by_category(val_df, subject)[:k]
+    for example in val_df:
+        prompt += format_cot_example(example, including_answer=True)
+    prompt += format_cot_example(curr, including_answer=False)
+    return prompt
+
+
+def load_mmlu_pro_splits():
+    dataset = load_dataset(DATASET_PATH, revision=DATASET_REVISION)
+    test_df, val_df = dataset["test"], dataset["validation"]
+    return _preprocess(test_df), _preprocess(val_df)
+
+
+# MMLU-PRO
+def load_mmlu_pro_dataset():
+    test_df, val_df = load_mmlu_pro_splits()
+    return [generate_cot_prompt(val_df, ex, k=5) for ex in test_df]
+
+
+def load_mmlu_pro_dataset_answer():
+    test_df, _ = load_mmlu_pro_splits()
     examples = []
-    for cat, items in by_cat.items():
-        picks = rng.sample(items, min(sample_per_category, len(items)))
-        for ex in picks:
-            opts = ex["options"]
-            options_str = "\n".join(
-                f"({chr(ord('A')+i)}) {opt}"
-                for i, opt in enumerate(opts)
-            )
-            prompt = QUERY_TEMPLATE.format(
-                question=ex["question"],
-                options=options_str
-            )
-            answer_letter = chr(ord('A') + ex["answer_index"])
-            examples.append({"question": prompt, "answer": answer_letter})
+    for ex in test_df:
+        answer_index = int(ex["answer_index"])
+        examples.append({
+            "category": ex["category"],
+            "question": ex["question"],
+            "options": ex["options"],
+            "answer": CHOICES[answer_index],
+            "answer_index": answer_index,
+        })
     return examples

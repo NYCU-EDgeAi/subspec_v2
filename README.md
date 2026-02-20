@@ -165,13 +165,75 @@ The following methods are available (registered in `run/core/presets.py`):
 # Quick sanity check
 python -m run.main --config configs/methods/<method_name>.yaml run-test
 
-# Detailed benchmark run
-python -m run.main --config configs/methods/<method_name>.yaml run-benchmark --benchmarks <benchmarks> --max-samples 20
+# Throughput-only benchmark (legacy path, no paired flips/KL)
+python -m run.main --config configs/methods/<method_name>.yaml run-benchmark --benchmarks mt-bench --max-samples 20
 ```
 
-### Examples
+Primary research workflows use `run-benchmark-acc` and `run-benchmark-compare`.
 
-**1. Evaluate SubSpec on MT-Bench with specific GPU:**
+```bash
+# Accuracy/perf on canonical multiple-choice benchmarks (LL-based)
+python -m run.main \
+  --config configs/methods/subspec_sd_no_offload.yaml \
+  run-benchmark-acc \
+  --benchmarks hellaswag,piqa,arc-c,winogrande \
+  --lane distribution \
+  --max-samples 200
+```
+
+```bash
+# Paired comparison on LL-only MC tasks (fp16 baseline vs Lossy-SD)
+python -m run.main \
+  --config configs/methods/subspec_sd_no_offload.yaml \
+  run-benchmark-compare \
+  --compare-config configs/methods/subspec_sd_lossy_no_offload.yaml \
+  --compare-name lossy_sd \
+  --benchmarks hellaswag,piqa,arc-c,winogrande \
+  --lane distribution \
+  --max-samples 200
+```
+
+```bash
+# Paired behavior comparison on decode-dominant tasks (task-native acc + flips)
+python -m run.main \
+  --config configs/methods/subspec_sd_no_offload.yaml \
+  run-benchmark-compare \
+  --compare-config configs/methods/subspec_sd_lossy_no_offload.yaml \
+  --compare-name lossy_sd \
+  --benchmarks gsm8k,human-eval \
+  --lane behavior \
+  --max-samples 200
+```
+
+MC benchmarks (`hellaswag,piqa,arc-c,winogrande`) are LL-only and use `--lane distribution`.
+
+```bash
+# Paired distribution comparison (fp16 baseline vs int4)
+python -m run.main \
+  --config configs/methods/subspec_sd_no_offload.yaml \
+  run-benchmark-compare \
+  --compare-config configs/methods/vanilla_int4.yaml \
+  --compare-name int4 \
+  --benchmarks hellaswag,piqa,arc-c,winogrande \
+  --lane distribution \
+  --max-samples 200
+```
+
+```bash
+# Reuse a previous baseline directory (skip baseline regeneration)
+python -m run.main \
+  --config configs/methods/subspec_sd_no_offload.yaml \
+  run-benchmark-compare \
+  --compare-config configs/methods/vanilla_int4.yaml \
+  --benchmarks hellaswag,piqa,arc-c,winogrande \
+  --lane distribution \
+  --reuse-baseline-dir experiments/<timestamp>/run_benchmark_compare \
+  --max-samples 200
+```
+
+### Quick Examples
+
+**1. Evaluate MT-Bench throughput on a specific GPU (legacy benchmark path):**
 ```bash
 python -m run.main --config configs/methods/subspec_sd.yaml --device "cuda:0" run-benchmark --benchmarks mt-bench --max-samples 20
 ```
@@ -181,8 +243,10 @@ python -m run.main --config configs/methods/subspec_sd.yaml --device "cuda:0" ru
 python -m run.main --config configs/methods/classic_sd.yaml --device "cuda:1" --warmup-iter 0 run-test
 ```
 
-**Selectable benchmarks:**
-"mt-bench", "human-eval", "gsm8k", "alpaca", "cnn-dm", "aime", "gpqa", "math-500", and "livecodebench".
+See [BENCHMARKING.md](BENCHMARKING.md) for:
+- lane definitions (`distribution` vs `behavior`)
+- benchmark recommendations per comparison goal
+- output schema and flip/KL metric interpretation
 
 > The datasets and pretrained models will be downloaded automatically from Hugging Face.
 

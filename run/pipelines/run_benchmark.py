@@ -1,15 +1,20 @@
 """Benchmark pipeline for throughput evaluation."""
 
 import os
-import shutil
-import json
 import time
 import logging
 from tqdm import tqdm
 
 from .benchmarks.registry import load_dataset, validate_benchmarks
 from .benchmarks.utils.eval import run_common_eval, run_mtbench_eval
-from .utils.benchmark_utils import reset_seeds, cleanup_gpu, setup_benchmark_dir
+from .utils.benchmark_utils import (
+    append_benchmark_result,
+    cleanup_gpu,
+    parse_benchmark_list,
+    prepare_output_dir,
+    reset_seeds,
+    setup_benchmark_dir,
+)
 
 BENCHMARK_EVALUATORS = {
     "mt-bench": run_mtbench_eval,
@@ -40,26 +45,35 @@ BENCHMARK_EVALUATORS = {
 }
 
 
+def _validate_pipeline_benchmarks(bench_list):
+    unsupported = [bench for bench in bench_list if bench not in BENCHMARK_EVALUATORS]
+    if unsupported:
+        raise ValueError(
+            "run-benchmark does not support benchmark(s): "
+            f"{unsupported}. Supported: {sorted(BENCHMARK_EVALUATORS.keys())}"
+        )
+
+
 def main(builder, benchmarks=None, max_samples=None):
     """Run throughput benchmarks on specified datasets."""
     reset_seeds(0)
     logging.basicConfig(level=os.environ.get("LOGLEVEL", "INFO").upper())
-    
+
+    # Validate benchmarks
+    bench_list = parse_benchmark_list(benchmarks)
+    if not bench_list:
+        raise ValueError("--benchmarks is required for run-benchmark")
+    validate_benchmarks(bench_list)
+    _validate_pipeline_benchmarks(bench_list)
+    print(f"Benchmarks to run: {bench_list}")
+
     builder.generator_profiling = True
     builder.profiling_verbose = False
     generator, tokenizer, past_kv, draft_past_kv = builder.build()
     args = builder.args
-    
-    # Validate benchmarks
-    bench_list = benchmarks.split(",") if benchmarks is not None else []
-    validate_benchmarks(bench_list)
-    print(f"Benchmarks to run: {bench_list}")
-    
+
     # Handle output directories
-    if args.out_dir is not None:
-        shutil.rmtree(args.out_dir, ignore_errors=True)
-        print(f"Deleted old {args.out_dir}")
-        os.makedirs(args.out_dir, exist_ok=True)
+    prepare_output_dir(args.out_dir)
         
     # Run benchmarks
     log_dir_base = os.path.join(args.log_dir, time.strftime("%Y%m%d-%H%M%S"), "run_benchmark")
@@ -81,8 +95,5 @@ def main(builder, benchmarks=None, max_samples=None):
         cleanup_gpu()
         
         # Save results
-        metrics_json["total_eval_time_s"] = round(eval_time_s, 3)
-        metrics_json = {k: round(v, 3) if isinstance(v, float) else v for k, v in metrics_json.items()}
-        with open(os.path.join(log_dir, "results.jsonl"), 'a') as f:
-            json.dump({bench_name: metrics_json}, f, indent=4)
-            f.write("\n")
+        metrics_json["total_eval_time_s"] = eval_time_s
+        append_benchmark_result(log_dir, bench_name, metrics_json, digits=3)
