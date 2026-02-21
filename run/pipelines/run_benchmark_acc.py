@@ -14,6 +14,7 @@ from .benchmarks.task_registry import (
     resolve_lane_for_task,
     validate_lane_compatibility,
 )
+from .benchmarks.utils.code_eval import validate_humaneval_runtime_requirements
 from .utils.benchmark_utils import (
     append_benchmark_result,
     cleanup_gpu,
@@ -51,6 +52,8 @@ def main(builder, benchmarks=None, max_samples=None, lane: str | None = None):
         raise ValueError("--benchmarks is required for run-benchmark-acc")
     validate_benchmarks(bench_list, with_answers=True)
     validate_lane_compatibility(bench_list, requested_lane)
+    if "human-eval" in bench_list or "human-eval-instruct" in bench_list:
+        validate_humaneval_runtime_requirements()
     print(f"Benchmarks to run: {bench_list}")
     print(f"Lane: {requested_lane or 'auto'}")
 

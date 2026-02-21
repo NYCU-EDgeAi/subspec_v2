@@ -37,6 +37,7 @@ _TASK_SPECS: Dict[str, TaskSpec] = {
     # Behavior lane (generation-based, SD-aware).
     "gsm8k": TaskSpec("gsm8k", {LANE_BEHAVIOR: evals.run_gsm8k_eval}),
     "human-eval": TaskSpec("human-eval", {LANE_BEHAVIOR: evals.run_humaneval_eval}),
+    "human-eval-instruct": TaskSpec("human-eval-instruct", {LANE_BEHAVIOR: evals.run_humaneval_eval}),
     "aime": TaskSpec("aime", {LANE_BEHAVIOR: evals.run_aime_eval}),
     "livecodebench": TaskSpec("livecodebench", {LANE_BEHAVIOR: evals.run_livecodebench_eval}),
     "mmlu_pro": TaskSpec("mmlu_pro", {LANE_BEHAVIOR: evals.run_mmlu_pro_eval}),

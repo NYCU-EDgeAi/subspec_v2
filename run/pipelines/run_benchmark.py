@@ -19,6 +19,7 @@ from .utils.benchmark_utils import (
 BENCHMARK_EVALUATORS = {
     "mt-bench": run_mtbench_eval,
     "human-eval": run_common_eval,
+    "human-eval-instruct": run_common_eval,
     "gsm8k": run_common_eval,
     "alpaca": run_common_eval,
     "cnn-dm": run_common_eval,

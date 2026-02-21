@@ -11,6 +11,7 @@ import random
 AVAILABLE_BENCHMARKS = [
     "mt-bench",
     "human-eval",
+    "human-eval-instruct",
     "gsm8k",
     "hellaswag",
     "piqa",
@@ -44,6 +45,11 @@ AVAILABLE_BENCHMARKS = [
 _LOADER_CONFIG = {
     "mt-bench": (".mtbench", "load_mtbench_dataset", "load_mtbench_dataset_answer"),
     "human-eval": (".humaneval", "load_humaneval_dataset", "load_humaneval_dataset_answer"),
+    "human-eval-instruct": (
+        ".humaneval",
+        "load_humaneval_instruct_dataset",
+        "load_humaneval_instruct_dataset_answer",
+    ),
     "gsm8k": (".gsm8k", "load_gsm8k_dataset", "load_gsm8k_dataset_answer"),
     "hellaswag": (".hellaswag", "load_hellaswag_dataset", "load_hellaswag_dataset_answer"),
     "piqa": (".piqa", "load_piqa_dataset", "load_piqa_dataset_answer"),

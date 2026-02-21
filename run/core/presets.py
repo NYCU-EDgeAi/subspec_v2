@@ -486,6 +486,28 @@ def register_presets():
         )
     except ImportError:
         pass
+    
+    # KV Rewrite
+    print("Registering KV Rewrite method...")
+    try:
+        from specdecodes.models.generators.kv_rewrite import KVRewriteGenerator
+        from specdecodes.models.draft_models.kv_rewrite import SubSpecSDDraftModel as KVRewriteDraftModel
+        from specdecodes.helpers.recipes.subspec.hqq_4bit_kv_rewrite import (
+            Recipe as KVRewriteRecipe,
+        )
+
+        ModelRegistry.register(
+            name="kv_rewrite",
+            generator_cls=KVRewriteGenerator,
+            draft_model_cls=KVRewriteDraftModel,
+            default_config={
+                "llm_path": "meta-llama/Llama-3.1-8B-Instruct",
+                "recipe": KVRewriteRecipe(),
+            },
+            needs_draft_kv_cache=False,
+        )
+    except ImportError:
+        pass
 
     # Vanilla Quant
     try:

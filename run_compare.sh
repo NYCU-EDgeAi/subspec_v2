@@ -19,6 +19,10 @@ SHUFFLE="${SHUFFLE:-1}"
 TOKEN_KL="${TOKEN_KL:-0}"                    # requested: 0/1
 LANE="${LANE:-behavior}"                     # behavior or distribution
 BENCHMARKS="${BENCHMARKS:-${BEHAVIOR_BENCHES:-gsm8k,human-eval}}"
+# Required for HumanEval (`evaluate` code_eval executes untrusted code).
+if [[ ",$BENCHMARKS," == *",human-eval,"* ]]; then
+  export HF_ALLOW_CODE_EVAL="${HF_ALLOW_CODE_EVAL:-1}"
+fi
 
 FP16_CFG="${FP16_CFG:-configs/methods/vanilla.yaml}"
 # Comma-separated list in "name=config_path" format.
@@ -137,6 +141,9 @@ echo "  samples   : $SAMPLES"
 echo "  max_len   : $MAX_LEN"
 echo "  shuffle   : $([[ "$SHUFFLE" == "1" ]] && echo on || echo off)"
 echo "  token_kl  : $([[ "$EFFECTIVE_TOKEN_KL" == "1" ]] && echo enabled || echo disabled)"
+if [[ ",$BENCHMARKS," == *",human-eval,"* ]]; then
+  echo "  code_eval : HF_ALLOW_CODE_EVAL=${HF_ALLOW_CODE_EVAL:-unset}"
+fi
 for i in "${!COMPARE_NAMES[@]}"; do
   idx=$((i + 1))
   echo "  ${idx}) fp16 vs ${COMPARE_NAMES[$i]}  (config: ${TMP_COMPARE_CFGS[$i]})"
@@ -239,12 +246,13 @@ for name, run_dir in zip(labels, dirs):
     print(f"[{name}] {run_dir}")
     for bench in benches:
         r = read_cmp(run_dir, bench)
-        print(
+        line = (
             f"  {bench:10s} base={fmtf(r['base_acc'])} cmp={fmtf(r['cmp_acc'])} "
             f"flips_rate={fmtf(r['flips_rate'])} c2i={r['flips_c2i_count']} i2c={r['flips_i2c_count']} "
             f"allflips_rate={r['allflips_rate']} output_change_rate={r['output_change_rate']} "
             f"wrong_to_wrong_change_rate={r['wrong_to_wrong_change_rate']}"
         )
+        print(line)
     print()
 PY
 

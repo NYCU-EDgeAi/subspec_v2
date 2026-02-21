@@ -25,15 +25,20 @@ from .benchmarks.utils.eval_acc import (
     _loglikelihood_continuation,
     _maybe_delimit,
 )
+from .benchmarks.utils.code_eval import (
+    compute_humaneval_pass_flags,
+    validate_humaneval_runtime_requirements,
+)
 from .utils.benchmark_utils import cleanup_gpu, parse_benchmark_list, reset_seeds, setup_benchmark_dir
+from run.core.config_utils import write_settings_yaml
 from run.pipelines.utils.eval_utils import reset_kv
-from run.pipelines.benchmarks.utils.human_eval.execution import check_correctness as humaneval_check_correctness
 
 
 MC_BENCHMARKS = {"hellaswag", "piqa", "arc-c", "winogrande"}
-TASK_NATIVE_ACCURACY_BENCHMARKS = {"gsm8k", "human-eval"}
+TASK_NATIVE_ACCURACY_BENCHMARKS = {"gsm8k", "human-eval", "human-eval-instruct"}
 BENCHMARKS_WITH_ANSWERS = MC_BENCHMARKS | TASK_NATIVE_ACCURACY_BENCHMARKS
 SUPPORTED_COMPARE_BENCHMARKS = BENCHMARKS_WITH_ANSWERS
+_PROMPT_BUDGET_WARNED: set[tuple[str, int, int]] = set()
 
 
 def _append_jsonl(path: str, record: Dict[str, Any], indent: int | None = None) -> None:
@@ -85,6 +90,28 @@ def _build_flip_metrics(
         "wrong_to_wrong_change_rate": wrong_to_wrong_change_rate,
         "flip_metric_schema": "v3_paper_aligned",
     }
+
+
+def _warn_if_prompt_near_budget(task_name: str, prompt_len: int, max_length: int, max_gen_toks: int) -> None:
+    """Warn once per task when prompt length leaves less than max_gen_toks headroom."""
+    if max_length is None:
+        return
+    threshold = max_length - max_gen_toks
+    if prompt_len <= threshold:
+        return
+    key = (task_name, max_length, max_gen_toks)
+    if key in _PROMPT_BUDGET_WARNED:
+        return
+    _PROMPT_BUDGET_WARNED.add(key)
+    logging.warning(
+        "%s prompt length (%d) exceeds max_length - max_gen_toks (%d - %d = %d). "
+        "Generation headroom is smaller than lm-eval-style budget.",
+        task_name,
+        prompt_len,
+        max_length,
+        max_gen_toks,
+        threshold,
+    )
 
 
 def _load_benchmark_dataset(
@@ -241,7 +268,7 @@ def _kl_from_logprobs(base_log_probs: torch.Tensor, compare_log_probs: torch.Ten
 
 
 def _build_compare_builder(base_builder, compare_config_path: str):
-    from run.main import _load_yaml_config, _resolve_method, _apply_yaml_overrides
+    from run.main import _build_settings_snapshot, _load_yaml_config, _resolve_method, _apply_yaml_overrides
     from run.core.configuration import AppConfig
     from run.core.registry import ModelRegistry
     from run.core.builder import GeneratorPipelineBuilder
@@ -269,6 +296,7 @@ def _build_compare_builder(base_builder, compare_config_path: str):
         "warmup_iter",
         "device",
         "cache_implementation",
+        "compile_mode",
         "generator_profiling",
         "profiling_verbose",
     ]:
@@ -283,12 +311,17 @@ def _build_compare_builder(base_builder, compare_config_path: str):
 
     config.recipe = instantiate_recipe(getattr(config, "recipe", None))
     config.config_path = compare_config_path
+    config.settings_snapshot = _build_settings_snapshot(
+        config=config,
+        config_path=compare_config_path,
+        subcommand_argv=["run-benchmark-compare", "--compare-config", compare_config_path],
+    )
 
     return GeneratorPipelineBuilder(config)
 
 
 def _extract_gsm8k_answer(text: str) -> str | None:
-    # Match OpenAI grade-school-math extraction behavior.
+    # Match lm-eval GSM8K flexible extraction behavior.
     from run.pipelines.benchmarks.gsm8k import (
         INVALID_ANS as GSM8K_INVALID_ANS,
         extract_answer as gsm8k_extract_answer,
@@ -300,6 +333,14 @@ def _extract_gsm8k_answer(text: str) -> str | None:
     return answer
 
 
+def _gsm8k_exact_match(candidate: str | None, reference: str | None) -> bool:
+    from run.pipelines.benchmarks.gsm8k import exact_match as gsm8k_exact_match
+
+    if candidate is None or reference is None:
+        return False
+    return gsm8k_exact_match(candidate, reference)
+
+
 def _generate_gsm8k_response(
     generator,
     tokenizer,
@@ -308,6 +349,9 @@ def _generate_gsm8k_response(
     past_key_values,
     draft_past_key_values,
 ) -> str | None:
+    from run.pipelines.benchmarks.gsm8k import MAX_GEN_TOKS as GSM8K_MAX_GEN_TOKS
+    from run.pipelines.benchmarks.gsm8k import STOP_STRINGS as GSM8K_STOP_STRINGS
+
     tokenizer.use_default_system_prompt = True
     input_ids = tokenizer.apply_chat_template(
         [{"role": "user", "content": prompt}],
@@ -317,6 +361,7 @@ def _generate_gsm8k_response(
     ).to(generator.device)
     if input_ids.shape[1] > args.max_length:
         return None
+    _warn_if_prompt_near_budget("gsm8k", int(input_ids.shape[1]), int(args.max_length), int(GSM8K_MAX_GEN_TOKS))
 
     with sdpa_kernel(backends=[SDPBackend.MATH]):
         output_ids = generator.generate(
@@ -324,6 +369,7 @@ def _generate_gsm8k_response(
             temperature=args.temperature,
             max_length=args.max_length,
             do_sample=args.do_sample,
+            stop_strings=GSM8K_STOP_STRINGS,
             past_key_values=past_key_values,
             draft_past_key_values=draft_past_key_values,
         )
@@ -349,7 +395,7 @@ def _run_gsm8k_baseline(
 
     for idx, entry in tqdm(enumerate(dataset), total=len(dataset), desc=f"{bench_name} baseline"):
         prompt = entry["question"]
-        gt_token = _extract_gsm8k_answer(str(entry["answer"]))
+        gt = _extract_gsm8k_answer(str(entry["answer"]))
 
         response = _generate_gsm8k_response(
             base_generator,
@@ -362,15 +408,15 @@ def _run_gsm8k_baseline(
         if response is None:
             continue
 
-        pred_token = _extract_gsm8k_answer(response)
-        correct = int(pred_token is not None and gt_token is not None and pred_token == gt_token)
+        pred = _extract_gsm8k_answer(response)
+        correct = int(_gsm8k_exact_match(pred, gt))
 
         _append_jsonl(
             base_log,
             {
                 "index": idx,
-                "pred": pred_token,
-                "answer": gt_token,
+                "pred": pred,
+                "answer": gt,
                 "correct": correct,
             },
         )
@@ -402,7 +448,7 @@ def _run_gsm8k_compare(
             continue
 
         prompt = entry["question"]
-        gt_token = _extract_gsm8k_answer(str(entry["answer"]))
+        gt = _extract_gsm8k_answer(str(entry["answer"]))
         response = _generate_gsm8k_response(
             compare_generator,
             compare_tokenizer,
@@ -415,7 +461,7 @@ def _run_gsm8k_compare(
             continue
 
         pred_cmp = _extract_gsm8k_answer(response)
-        correct_cmp = int(pred_cmp is not None and gt_token is not None and pred_cmp == gt_token)
+        correct_cmp = int(_gsm8k_exact_match(pred_cmp, gt))
 
         base_rec = base_records[idx]
         pred_base = base_rec.get("pred")
@@ -436,7 +482,7 @@ def _run_gsm8k_compare(
             pair_log,
             {
                 "index": idx,
-                "answer": gt_token,
+                "answer": gt,
                 "base": {
                     "pred": pred_base,
                     "correct": int(correct_base),
@@ -473,10 +519,20 @@ def _generate_humaneval_completion(
     prompt: str,
     past_key_values,
     draft_past_key_values,
+    task_name: str = "human-eval",
 ) -> str | None:
+    from run.pipelines.benchmarks.humaneval import MAX_GEN_TOKS as HUMANEVAL_MAX_GEN_TOKS
+    from run.pipelines.benchmarks.humaneval import STOP_STRINGS as HUMANEVAL_STOP_STRINGS
+
     input_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(generator.device)
     if input_ids.shape[1] > args.max_length:
         return None
+    _warn_if_prompt_near_budget(
+        task_name,
+        int(input_ids.shape[1]),
+        int(args.max_length),
+        int(HUMANEVAL_MAX_GEN_TOKS),
+    )
 
     with sdpa_kernel(backends=[SDPBackend.MATH]):
         output_ids = generator.generate(
@@ -484,6 +540,7 @@ def _generate_humaneval_completion(
             temperature=args.temperature,
             max_length=args.max_length,
             do_sample=args.do_sample,
+            stop_strings=HUMANEVAL_STOP_STRINGS,
             past_key_values=past_key_values,
             draft_past_key_values=draft_past_key_values,
         )
@@ -508,29 +565,51 @@ def _run_humaneval_baseline(
 ):
     base_log = os.path.join(log_dir, f"{bench_name}_base.jsonl")
     timeout = float(getattr(base_args, "humaneval_timeout", 3.0))
+    n_workers = int(getattr(base_args, "humaneval_workers", 4))
+    pending: List[Tuple[int, Dict[str, Any], str]] = []
 
     for idx, entry in tqdm(enumerate(dataset), total=len(dataset), desc=f"{bench_name} baseline"):
         completion = _generate_humaneval_completion(
             base_generator,
             base_tokenizer,
             base_args,
-            entry["prompt"],
+            entry.get("prompt_input", entry["prompt"]),
             past_key_values,
             draft_past_key_values,
+            task_name=bench_name,
         )
         if completion is None:
             continue
+        pending.append((idx, entry, completion))
 
-        verdict = humaneval_check_correctness(entry, completion, timeout=timeout)
-        correct = int(bool(verdict.get("passed", False)))
+    if not pending:
+        return
 
+    problems = [
+        {
+            "prompt": entry["prompt"],
+            "prediction_style": entry.get("prediction_style", "plain"),
+            "test": entry["test"],
+            "entry_point": entry["entry_point"],
+        }
+        for _, entry, _ in pending
+    ]
+    completions = [completion for _, _, completion in pending]
+    correct_flags = compute_humaneval_pass_flags(
+        problems,
+        completions,
+        num_workers=n_workers,
+        timeout=timeout,
+    )
+
+    for (idx, entry, completion), correct in zip(pending, correct_flags):
         _append_jsonl(
             base_log,
             {
                 "index": idx,
                 "task_id": entry["task_id"],
                 "completion": completion,
-                "correct": correct,
+                "correct": int(correct),
             },
         )
 
@@ -549,6 +628,7 @@ def _run_humaneval_compare(
     pair_log = os.path.join(log_dir, f"{bench_name}_compare.jsonl")
     base_records = _load_indexed_jsonl(base_log)
     timeout = float(getattr(compare_args, "humaneval_timeout", 3.0))
+    n_workers = int(getattr(compare_args, "humaneval_workers", 4))
 
     total = 0
     base_correct = 0
@@ -556,6 +636,7 @@ def _run_humaneval_compare(
     flips_pos = 0
     flips_neg = 0
     output_change_count = 0
+    pending: List[Tuple[int, Dict[str, Any], Dict[str, Any], str]] = []
 
     for idx, entry in tqdm(enumerate(dataset), total=len(dataset), desc=f"{bench_name} compare"):
         if idx not in base_records:
@@ -565,17 +646,44 @@ def _run_humaneval_compare(
             compare_generator,
             compare_tokenizer,
             compare_args,
-            entry["prompt"],
+            entry.get("prompt_input", entry["prompt"]),
             past_key_values,
             draft_past_key_values,
+            task_name=bench_name,
         )
         if completion_cmp is None:
             continue
+        pending.append((idx, entry, base_records[idx], completion_cmp))
 
-        verdict_cmp = humaneval_check_correctness(entry, completion_cmp, timeout=timeout)
-        correct_cmp = int(bool(verdict_cmp.get("passed", False)))
+    if not pending:
+        return {
+            "base_accuracy": 0.0,
+            "compare_accuracy": 0.0,
+            "kl_choice": None,
+            "kl_token": None,
+            "samples": 0,
+            **_build_flip_metrics(0, 0, 0, output_change_count=0),
+        }
 
-        base_rec = base_records[idx]
+    problems = [
+        {
+            "prompt": entry["prompt"],
+            "prediction_style": entry.get("prediction_style", "plain"),
+            "test": entry["test"],
+            "entry_point": entry["entry_point"],
+        }
+        for _, entry, _, _ in pending
+    ]
+    completions = [completion_cmp for _, _, _, completion_cmp in pending]
+    correct_flags = compute_humaneval_pass_flags(
+        problems,
+        completions,
+        num_workers=n_workers,
+        timeout=timeout,
+    )
+
+    for (idx, entry, base_rec, completion_cmp), correct_cmp in zip(pending, correct_flags):
+        correct_cmp = int(correct_cmp)
         completion_base = base_rec.get("completion", "")
         correct_base = int(base_rec.get("correct", 0))
         output_changed = int(completion_cmp != str(completion_base))
@@ -907,7 +1015,7 @@ def _run_baseline_for_benchmark(
             base_past_kv,
             base_draft_kv,
         )
-    elif bench_name == "human-eval":
+    elif bench_name in {"human-eval", "human-eval-instruct"}:
         _run_humaneval_baseline(
             base_generator,
             base_tokenizer,
@@ -964,7 +1072,7 @@ def _run_compare_for_benchmark(
             compare_past_kv,
             compare_draft_kv,
         )
-    if bench_name == "human-eval":
+    if bench_name in {"human-eval", "human-eval-instruct"}:
         return _run_humaneval_compare(
             compare_generator,
             compare_tokenizer,
@@ -1008,6 +1116,8 @@ def main(
     lane = normalize_lane(lane or LANE_DISTRIBUTION)
     validate_lane_compatibility(bench_list, lane)
     _validate_compare_benchmarks(bench_list)
+    if "human-eval" in bench_list or "human-eval-instruct" in bench_list:
+        validate_humaneval_runtime_requirements()
 
     if lane == LANE_BEHAVIOR:
         token_kl = False
@@ -1085,6 +1195,11 @@ def main(
 
     for bench_name, log_dir, base_log_dir in tqdm(bench_jobs, desc="Compare phase"):
         reset_seeds(seed)
+        # Preserve both snapshots: base config and compare config.
+        write_settings_yaml(log_dir, getattr(builder.args, "settings_snapshot", None), filename="settings_base.yaml")
+        write_settings_yaml(log_dir, getattr(compare_args, "settings_snapshot", None), filename="settings.yaml")
+        write_settings_yaml(log_dir, getattr(compare_args, "settings_snapshot", None), filename="settings_compare.yaml")
+
         dataset = _load_benchmark_dataset(bench_name, max_samples, seed, shuffle)
 
         base_log = os.path.join(base_log_dir, f"{bench_name}_base.jsonl")

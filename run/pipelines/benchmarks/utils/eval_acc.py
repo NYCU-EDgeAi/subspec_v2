@@ -3,6 +3,7 @@
 import base64
 import gc
 import json
+import logging
 import os
 import pickle
 import random
@@ -31,8 +32,7 @@ from .utils import (
 )
 from specdecodes.models.utils.wandb_logger import wandb_logger
 from run.pipelines.utils.eval_utils import reset_kv, maybe_init_cuda_graph_runner
-from .human_eval.evaluation import evaluate_functional_correctness
-from .human_eval.data import write_jsonl
+from .code_eval import compute_humaneval_pass_at_k
 from .lcb_runner.evaluation.compute_code_generation_metrics import check_correctness as lcb_check_correctness
 from .lcb_runner.evaluation.pass_k_utils import compute_metrics_from_results as lcb_compute_metrics
 from .lcb_runner.utils.extraction_utils import extract_code as lcb_extract_code
@@ -62,6 +62,30 @@ DATASET_TO_METRIC = {
     "repobench_p": code_sim_score,
 }
 dataset2metric = DATASET_TO_METRIC
+
+_PROMPT_BUDGET_WARNED: set[tuple[str, int, int]] = set()
+
+
+def _warn_if_prompt_near_budget(task_name: str, prompt_len: int, max_length: int, max_gen_toks: int) -> None:
+    """Warn once per task when max_length leaves less than max_gen_toks generation budget."""
+    if max_length is None:
+        return
+    threshold = max_length - max_gen_toks
+    if prompt_len <= threshold:
+        return
+    key = (task_name, max_length, max_gen_toks)
+    if key in _PROMPT_BUDGET_WARNED:
+        return
+    _PROMPT_BUDGET_WARNED.add(key)
+    logging.warning(
+        "%s prompt length (%d) exceeds max_length - max_gen_toks (%d - %d = %d). "
+        "Generation headroom is smaller than lm-eval-style budget.",
+        task_name,
+        prompt_len,
+        max_length,
+        max_gen_toks,
+        threshold,
+    )
 
 
 # ---- Perf tracking -------------------------------------------------------
@@ -223,13 +247,16 @@ def run_gsm8k_eval(generator, tokenizer, past_key_values, draft_past_key_values,
     # Lists to accumulate throughput, token acceptance, draft/target times
     perf = _init_perf()
 
-    # Counters for overall question accuracy
+    # Counters for overall question accuracy.
     total_q = 0
     correct_q = 0
 
-    # Match the official grade-school-math extraction behavior.
+    # Match lm-eval GSM8K flexible extraction behavior.
     from run.pipelines.benchmarks.gsm8k import (
+        MAX_GEN_TOKS as GSM8K_MAX_GEN_TOKS,
+        STOP_STRINGS as GSM8K_STOP_STRINGS,
         INVALID_ANS as GSM8K_INVALID_ANS,
+        exact_match as gsm8k_exact_match,
         extract_answer as gsm8k_extract_answer,
     )
 
@@ -247,6 +274,7 @@ def run_gsm8k_eval(generator, tokenizer, past_key_values, draft_past_key_values,
         if input_ids.shape[1] > args.max_length:
             # Skip prompts that exceed max_length
             continue
+        _warn_if_prompt_near_budget("gsm8k", int(input_ids.shape[1]), int(args.max_length), int(GSM8K_MAX_GEN_TOKS))
 
         with sdpa_kernel(backends=[SDPBackend.MATH]):
             output_ids = generator.generate(
@@ -254,6 +282,7 @@ def run_gsm8k_eval(generator, tokenizer, past_key_values, draft_past_key_values,
                 temperature=args.temperature,
                 max_length=args.max_length,
                 do_sample=args.do_sample,
+                stop_strings=GSM8K_STOP_STRINGS,
                 past_key_values=past_key_values,
                 draft_past_key_values=draft_past_key_values
             )
@@ -272,22 +301,22 @@ def run_gsm8k_eval(generator, tokenizer, past_key_values, draft_past_key_values,
             "peak_memory": torch.cuda.max_memory_reserved(generator.device) / (1024 ** 3)
         })
 
-        # 2.3 Compute per-sample correctness
-        pred_answer = gsm8k_extract_answer(output_str)
-        gt_answer = gsm8k_extract_answer(ground_truth_text)
+        # 2.3 Compute per-sample correctness.
+        pred = gsm8k_extract_answer(output_str)
+        gt = gsm8k_extract_answer(ground_truth_text)
         is_correct = (
-            pred_answer != GSM8K_INVALID_ANS
-            and gt_answer != GSM8K_INVALID_ANS
-            and pred_answer == gt_answer
+            pred != GSM8K_INVALID_ANS
+            and gt != GSM8K_INVALID_ANS
+            and gsm8k_exact_match(pred, gt)
         )
         total_q += 1
         if is_correct:
             correct_q += 1
 
-        # Include per-sample Accuracy flag in JSON record
+        # Include per-sample accuracy and extracted answers.
         record["Accuracy"] = int(is_correct)
-        record["pred_answer"] = None if pred_answer == GSM8K_INVALID_ANS else pred_answer
-        record["answer_extracted"] = None if gt_answer == GSM8K_INVALID_ANS else gt_answer
+        record["pred_answer"] = None if pred == GSM8K_INVALID_ANS else pred
+        record["answer_extracted"] = None if gt == GSM8K_INVALID_ANS else gt
 
         # Append metrics lists
         _accum_perf(perf, record)
@@ -799,52 +828,6 @@ def _extract_code(text: str) -> str:
     return text.strip()
 
 
-def _build_humaneval_program(prompt: str, completion: str, entry_point: str) -> str:
-    completion = _extract_code(completion)
-    if re.search(rf"def\s+{re.escape(entry_point)}\s*\(", completion):
-        lines = prompt.splitlines()
-        preamble_lines = []
-        for line in lines:
-            if line.lstrip().startswith("def "):
-                break
-            preamble_lines.append(line)
-        preamble = "\n".join(preamble_lines).rstrip()
-        if preamble:
-            preamble += "\n\n"
-        return preamble + completion
-    prompt_text = prompt if prompt.endswith("\n") else prompt + "\n"
-    return prompt_text + completion
-
-
-# ---- HumanEval ------------------------------------------------------------
-def check_humaneval_correctness(problem: dict, completion: str, timeout: float = 3.0) -> dict:
-    """
-    Minimal HumanEval correctness checker using the dataset's test harness.
-    """
-    program = _build_humaneval_program(problem["prompt"], completion, problem["entry_point"])
-    test_code = problem["test"]
-    entry_point = problem["entry_point"]
-
-    with tempfile.TemporaryDirectory() as temp_dir:
-        code_path = os.path.join(temp_dir, "main.py")
-        with open(code_path, "w", encoding="utf-8") as f:
-            f.write(program)
-            f.write("\n\n")
-            f.write(test_code)
-            f.write("\n\n")
-            f.write(f"check({entry_point})\n")
-
-        try:
-            proc = subprocess.run(
-                ["python", code_path],
-                capture_output=True,
-                timeout=timeout,
-            )
-            return {"passed": proc.returncode == 0}
-        except (subprocess.TimeoutExpired, Exception):
-            return {"passed": False}
-
-
 def run_humaneval_eval(
     generator,
     tokenizer,
@@ -853,33 +836,37 @@ def run_humaneval_eval(
     args,
     dataset,
     log_dir,
+    bench_name: str | None = None,
     n_samples: int = 1,
     test_timeout: float = 3.0,
 ):
-    """
-    Evaluate HumanEval using the official human-eval evaluation (pass@k).
-    Dataset entries should include:
-        "question", "prompt", "test", "entry_point", "task_id"
-    """
+    """Evaluate HumanEval with lm-eval-style generation settings and pass@k correctness."""
     os.makedirs(log_dir, exist_ok=True)
 
-    humaneval_samples = os.path.join(log_dir, "humaneval_samples.jsonl")
-    humaneval_problems = os.path.join(log_dir, "humaneval_problems.jsonl")
     log_file = os.path.join(log_dir, "humaneval.jsonl")
 
     n_samples = int(getattr(args, "humaneval_n_samples", n_samples))
     n_workers = int(getattr(args, "humaneval_workers", 4))
     test_timeout = float(getattr(args, "humaneval_timeout", test_timeout))
+    from run.pipelines.benchmarks.humaneval import MAX_GEN_TOKS as HUMANEVAL_MAX_GEN_TOKS
+    from run.pipelines.benchmarks.humaneval import STOP_STRINGS as HUMANEVAL_STOP_STRINGS
 
     perf = _init_perf()
-    samples = []
-    problem_records = []
+    evaluated_problems = []
+    completions_by_problem = []
 
     for idx, problem in tqdm(enumerate(dataset), total=len(dataset), desc="Generating HumanEval samples"):
-        prompt = problem["prompt"]
+        prompt = problem.get("prompt_input", problem["prompt"])
         input_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(generator.device)
         if input_ids.shape[1] > args.max_length:
             continue
+        _warn_if_prompt_near_budget(
+            bench_name or "human-eval",
+            int(input_ids.shape[1]),
+            int(args.max_length),
+            int(HUMANEVAL_MAX_GEN_TOKS),
+        )
+        completions_for_problem = []
 
         for _ in range(n_samples):
             with sdpa_kernel(backends=[SDPBackend.MATH]):
@@ -888,6 +875,7 @@ def run_humaneval_eval(
                     temperature=args.temperature,
                     max_length=args.max_length,
                     do_sample=args.do_sample,
+                    stop_strings=HUMANEVAL_STOP_STRINGS,
                     past_key_values=past_key_values,
                     draft_past_key_values=draft_past_key_values,
                 )
@@ -899,11 +887,7 @@ def run_humaneval_eval(
                 output_ids[0, input_ids.shape[1]:],
                 skip_special_tokens=True
             )
-
-            samples.append({
-                "task_id": problem["task_id"],
-                "completion": completion,
-            })
+            completions_for_problem.append(completion)
 
             record = {
                 **wandb_logger.log_data,
@@ -916,26 +900,26 @@ def run_humaneval_eval(
                 json.dump(record, f)
                 f.write("\n")
 
-        problem_records.append({
-            "task_id": problem["task_id"],
-            "prompt": problem["prompt"],
-            "test": problem["test"],
-            "entry_point": problem["entry_point"],
-        })
+        if completions_for_problem:
+            evaluated_problems.append({
+                "task_id": problem["task_id"],
+                "prompt": problem["prompt"],
+                "prediction_style": problem.get("prediction_style", "plain"),
+                "test": problem["test"],
+                "entry_point": problem["entry_point"],
+            })
+            completions_by_problem.append(completions_for_problem)
 
         del input_ids, output_ids
         gc.collect()
         torch.cuda.empty_cache()
 
-    write_jsonl(humaneval_samples, samples)
-    write_jsonl(humaneval_problems, problem_records)
-
-    pass_at_k = evaluate_functional_correctness(
-        humaneval_samples,
-        k=[1, 10, 100],
-        n_workers=n_workers,
+    pass_at_k = compute_humaneval_pass_at_k(
+        evaluated_problems,
+        completions_by_problem,
+        k=(1, 10, 100),
+        num_workers=n_workers,
         timeout=test_timeout,
-        problem_file=humaneval_problems,
     )
 
     accuracy = float(pass_at_k.get("pass@1", 0.0))
