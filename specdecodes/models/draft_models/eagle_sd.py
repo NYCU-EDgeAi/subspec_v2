@@ -141,7 +141,8 @@ class EagleSDDraftModel(ClassicSDDraftModel):
 
         # 6) Main loop
         for depth_i in range(self.draft_params.max_depth-1):
-            self.speculate_once()
+            if not self.speculate_once():
+                break
              
         # Update and obtain the final tree
         self.update_tree(self.tree_data)
@@ -155,6 +156,12 @@ class EagleSDDraftModel(ClassicSDDraftModel):
         parent_probs = self.parent_probs
         position_ids = self.position_ids
         cache_position = self.cache_position
+
+        if not self._has_postspec_headroom(
+            step_tokens=int(cache_position.numel()),
+            cache_position=cache_position,
+        ):
+            return False
         
         with nvtx.annotate("draft_forward", color="red"):
             sampled_probs, hidden_states = self(
@@ -189,6 +196,7 @@ class EagleSDDraftModel(ClassicSDDraftModel):
         self.parent_probs = parent_probs
         self.position_ids += 1
         self.cache_position += self.draft_params.topk_len
+        return True
     
     def final_update(self, input_ids, hidden_states, **kwargs):
         input_ids = input_ids[:, 1:]

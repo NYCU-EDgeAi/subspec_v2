@@ -1,7 +1,7 @@
 import logging
 import os
 import random
-from typing import Any, Optional, TYPE_CHECKING
+from typing import Optional, TYPE_CHECKING
 from types import SimpleNamespace
 
 import torch
@@ -152,45 +152,8 @@ class GeneratorPipelineBuilder:
                     
         if self.cache_implementation == "static":
             if self.max_length is not None:
-                if draft_model is not None:
-                    # Additional speculative tokens may cause KV-cache to exceed `max_length`.
-                    # We allocate extra headroom based on draft params.
-                    def _infer_max_verify_tokens(draft_params: Any) -> int:
-                        if not draft_params:
-                            return 0
-
-                        # Support DraftParams dataclass, SimpleNamespace, or raw dict.
-                        if isinstance(draft_params, dict):
-                            if "max_verify_tokens" in draft_params and draft_params["max_verify_tokens"] is not None:
-                                return int(draft_params["max_verify_tokens"])
-                            if "max_sample_tokens" in draft_params and draft_params["max_sample_tokens"] is not None:
-                                return int(draft_params["max_sample_tokens"])
-                            if "num_nodes" in draft_params and draft_params["num_nodes"] is not None:
-                                return int(draft_params["num_nodes"]) + 1
-                            if "max_depth" in draft_params and "topk_len" in draft_params:
-                                try:
-                                    return int(draft_params["max_depth"]) * int(draft_params["topk_len"]) + 1
-                                except Exception:
-                                    return 0
-                            return 0
-
-                        if hasattr(draft_params, "max_verify_tokens") and getattr(draft_params, "max_verify_tokens") is not None:
-                            return int(getattr(draft_params, "max_verify_tokens"))
-                        if hasattr(draft_params, "max_sample_tokens") and getattr(draft_params, "max_sample_tokens") is not None:
-                            return int(getattr(draft_params, "max_sample_tokens"))
-                        if hasattr(draft_params, "num_nodes") and getattr(draft_params, "num_nodes") is not None:
-                            return int(getattr(draft_params, "num_nodes")) + 1
-                        if hasattr(draft_params, "max_depth") and hasattr(draft_params, "topk_len"):
-                            try:
-                                return int(getattr(draft_params, "max_depth")) * int(getattr(draft_params, "topk_len")) + 1
-                            except Exception:
-                                return 0
-                        return 0
-
-                    max_verify_tokens = _infer_max_verify_tokens(getattr(self, "draft_params", None))
-                    max_cache_len = int(self.max_length) + int(max_verify_tokens)
-                else:
-                    max_cache_len = self.max_length
+                # `max_length` is the hard upper bound for generation and KV cache.
+                max_cache_len = int(self.max_length)
             else:
                 raise ValueError("max_length should be set for static cache.")
             
@@ -294,11 +257,17 @@ class GeneratorPipelineBuilder:
         # If the target model uses offloading, torch.compile() (especially fullgraph/cudagraph-related paths)
         # is typically incompatible or provides little benefit. Skip compiling target_model in that case.
         has_offloader = bool(getattr(self.recipe, "offloader", None))
-        if has_offloader:
+        is_no_offload_method = method_name.endswith("_no_offload") or method_name.endswith("_no_offloader")
+        if has_offloader or is_no_offload_method:
             logging.info("Skipping torch.compile() for target_model because recipe.offloader is set.")
         else:
-            generator.target_model.forward = torch.compile(generator.target_model.forward, mode=self.compile_mode, dynamic=False, fullgraph=fullgraph)
-
+            generator.target_model.forward = torch.compile(
+                generator.target_model.forward,
+                mode=self.compile_mode,
+                dynamic=False,
+                fullgraph=fullgraph,
+            )
+        
         # Compile draft model if it exists
         if getattr(generator, 'draft_model', None) is not None:
             try:

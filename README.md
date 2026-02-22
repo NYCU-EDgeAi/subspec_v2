@@ -165,17 +165,17 @@ The following methods are available (registered in `run/core/presets.py`):
 # Quick sanity check
 python -m run.main --config configs/methods/<method_name>.yaml run-test
 
-# Throughput-only benchmark (legacy path, no paired flips/KL)
-python -m run.main --config configs/methods/<method_name>.yaml run-benchmark --benchmarks mt-bench --max-samples 20
+# Single-model benchmark (lane-based)
+python -m run.main --config configs/methods/<method_name>.yaml run-benchmark --benchmarks gsm8k --lane behavior --max-samples 20
 ```
 
-Primary research workflows use `run-benchmark-acc` and `run-benchmark-compare`.
+Primary research workflows use `run-benchmark` and `run-benchmark-compare`.
 
 ```bash
 # Accuracy/perf on canonical multiple-choice benchmarks (LL-based)
 python -m run.main \
   --config configs/methods/subspec_sd_no_offload.yaml \
-  run-benchmark-acc \
+  run-benchmark \
   --benchmarks hellaswag,piqa,arc-c,winogrande \
   --lane distribution \
   --max-samples 200
@@ -233,9 +233,9 @@ python -m run.main \
 
 ### Quick Examples
 
-**1. Evaluate MT-Bench throughput on a specific GPU (legacy benchmark path):**
+**1. Evaluate behavior lane benchmarks on a specific GPU:**
 ```bash
-python -m run.main --config configs/methods/subspec_sd.yaml --device "cuda:0" run-benchmark --benchmarks mt-bench --max-samples 20
+python -m run.main --config configs/methods/subspec_sd.yaml --device "cuda:0" run-benchmark --benchmarks gsm8k --lane behavior --max-samples 20
 ```
 
 **2. Run a quick test with Classic SD on a different GPU:**

@@ -119,7 +119,8 @@ class SubSpecSDDraftModel(ClassicSDDraftModel):
         
         # 6) Main loop
         for depth_i in range(self.draft_params.max_depth-1):
-            self.speculate_once()
+            if not self.speculate_once():
+                break
 
         # Update and obtain the final tree
         self.update_tree(self.tree_data)
@@ -132,12 +133,20 @@ class SubSpecSDDraftModel(ClassicSDDraftModel):
     @torch.no_grad()
     def postspec(self):
         if not self.had_first_speculate:
-            return
+            return False
         if self.postspec_count > (self.draft_params.max_depth - 1):
-            return
+            return False
+        if not self._has_postspec_headroom(
+            step_tokens=int(getattr(self, "cache_position", torch.empty(0)).numel()),
+            cache_position=getattr(self, "cache_position", None),
+        ):
+            return False
         with nvtx.annotate("postspec_step", color="blue"):
-            self.speculate_once()
+            progressed = self.speculate_once()
+        if not progressed:
+            return False
         self.postspec_count += 1
+        return True
     
     def update_tree_after_post(self):
         """Return the finalized draft tree after post-speculation."""

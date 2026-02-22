@@ -52,7 +52,8 @@ class ClassicSDDraftModel(DraftModelBase):
         
         # 5) Main loop
         for depth_i in range(self.draft_params.max_depth-1):
-            self.speculate_once()
+            if not self.speculate_once():
+                break
         
         return torch.cat(self.token_ids, dim=-1)
     
@@ -60,6 +61,12 @@ class ClassicSDDraftModel(DraftModelBase):
     def speculate_once(self, **kwargs):
         token_ids = self.token_ids
         cache_position = self.cache_position
+
+        if not self._has_postspec_headroom(
+            step_tokens=int(cache_position.numel()),
+            cache_position=cache_position,
+        ):
+            return False
 
         with nvtx.annotate("draft_forward", color="red"):
             sampled_probs = self(
@@ -79,3 +86,4 @@ class ClassicSDDraftModel(DraftModelBase):
         # Update internal state
         self.token_ids = token_ids
         self.cache_position += 1
+        return True

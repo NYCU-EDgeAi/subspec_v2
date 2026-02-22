@@ -213,6 +213,53 @@ class Tree:
 
         self.available_leaves = [i for i, n in enumerate(self.nodes) if not is_parent[i]]
         return torch.tensor(keep_list, dtype=torch.long) 
+
+    def truncate_prefix(self, max_size: int) -> torch.Tensor:
+        """Keep the first `max_size` nodes in index order and drop the tail.
+
+        This preserves a contiguous prefix of the existing indexing, which is
+        important for `skip_nodes`-based decode slices.
+        """
+        if max_size < 0:
+            raise ValueError("max_size must be >= 0")
+        if max_size == 0:
+            self.nodes = []
+            self.current_size = 0
+            self.available_leaves = []
+            return torch.empty(0, dtype=torch.long)
+        if self.current_size <= max_size:
+            return torch.arange(self.current_size, device='cpu')
+
+        keep_list = list(range(int(max_size)))
+        old2new = {old_i: new_i for new_i, old_i in enumerate(keep_list)}
+        new_nodes: List[TreeNode] = []
+
+        for old_i in keep_list:
+            o_node = self.nodes[old_i]
+            new_parent = old2new[o_node.parent] if o_node.parent in old2new else None
+            n_node = TreeNode(
+                parent=new_parent,
+                token_id=o_node.token_id,
+                cumulative_probability=o_node.cumulative_probability,
+                depth=o_node.depth,
+            )
+            n_node.has_been_sampled = o_node.has_been_sampled
+            new_nodes.append(n_node)
+
+        for new_i, old_i in enumerate(keep_list):
+            for c_old in self.nodes[old_i].children:
+                if c_old in old2new:
+                    new_nodes[new_i].children.append(old2new[c_old])
+
+        self.nodes = new_nodes
+        self.current_size = len(new_nodes)
+
+        is_parent = [bool(n.children) for n in self.nodes]
+        for i, n in enumerate(self.nodes):
+            if not is_parent[i]:
+                n.has_been_sampled = False
+        self.available_leaves = [i for i, n in enumerate(self.nodes) if not is_parent[i]]
+        return torch.tensor(keep_list, dtype=torch.long)
     
     def get_node(self, node_index: int) -> TreeNode:
         if node_index < 0 or node_index >= self.current_size:

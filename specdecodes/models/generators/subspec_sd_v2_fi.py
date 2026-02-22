@@ -105,7 +105,8 @@ class SubSpecSDGeneratorBase(ClassicSDGeneratorBase):
             with nvtx.annotate("postspec_refill", color="cyan"):
                 self.draft_model.init_postspec()
                 for _ in range(refill_steps):
-                    self.draft_model.postspec()
+                    if not self.draft_model.postspec():
+                        break
             tree = self.draft_model.update_tree_after_post()
 
         return tree
@@ -223,6 +224,11 @@ class SubSpecSDGeneratorBase(ClassicSDGeneratorBase):
             next_token_logits = outputs.logits
             del outputs
 
+        remaining = self._remaining_token_budget(input_ids, stopping_criteria)
+        if remaining is not None and int(remaining) <= 0:
+            request_kv_cache.release()
+            return input_ids
+
         with nvtx.annotate("sample"):
             sampled_tokens = self._sample_token(next_token_logits, logits_processor, do_sample)
 
@@ -243,19 +249,23 @@ class SubSpecSDGeneratorBase(ClassicSDGeneratorBase):
             root_ind = 0
 
             while not finished:
+                remaining = self._remaining_token_budget(input_ids, stopping_criteria)
+                if remaining is not None and int(remaining) <= 0:
+                    break
+
                 if is_prev_accepted:
                     skip_nodes = last_tree_size
-                    # with nvtx.annotate("post_verify", color="cyan"):
-                    #     tree = self._post_verify(
-                    #         tree,
-                    #         root_ind,
-                    #         request_kv_cache,
-                    #         position_offset,
-                    #         last_tree_depth,
-                    #         skip_nodes,
-                    #         logits_processor,
-                    #         input_ids.device,
-                    #     )
+                    with nvtx.annotate("post_verify", color="cyan"):
+                        tree = self._post_verify(
+                            tree,
+                            root_ind,
+                            request_kv_cache,
+                            position_offset,
+                            last_tree_depth,
+                            skip_nodes,
+                            logits_processor,
+                            input_ids.device,
+                        )
                     last_tree_size = tree.size()
                     last_tree_depth = tree.get_depth()
 
@@ -270,10 +280,20 @@ class SubSpecSDGeneratorBase(ClassicSDGeneratorBase):
                     skip_nodes = 0
                     position_offset = input_ids.shape[1] - 1
 
+                decoded_tree_size = self._cap_tree_to_budget(
+                    tree,
+                    input_ids,
+                    stopping_criteria,
+                    skip_nodes=skip_nodes,
+                )
+                if decoded_tree_size <= 0:
+                    break
+                last_tree_size = tree.size()
+
                 with nvtx.annotate("target_decode", color="orange"):
                     # Allow draft model to accumulate async post-spec data if it does so.
                     self.draft_model.init_postspec()
-                    num_tokens = tree.size() - skip_nodes
+                    num_tokens = int(decoded_tree_size)
 
                     batch_position = getKvCacheBatchPosition(
                         request_kv_caches=[request_kv_cache],

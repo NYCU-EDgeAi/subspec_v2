@@ -51,17 +51,7 @@ def run_app(builder):
         )
         
     @app.command()
-    def run_benchmark(benchmarks: str = None, max_samples: int = None):
-        """
-        Example subcommand for benchmarking.
-        Usage: 
-            python custom.py run-benchmark --bench-name=mt-bench
-        """
-        from run.pipelines.run_benchmark import main as main_run_benchmark
-        main_run_benchmark(builder, benchmarks=benchmarks, max_samples=max_samples)
-        
-    @app.command()
-    def run_benchmark_acc(
+    def run_benchmark(
         benchmarks: str = None,
         max_samples: int = None,
         lane: str = typer.Option(
@@ -70,19 +60,24 @@ def run_app(builder):
         ),
     ):
         """
-        Example subcommand for benchmarking.
-        Usage: 
-            python custom.py run-benchmark --bench-name=mt-bench
+        Lane-based benchmark evaluation.
+        Usage:
+            python -m run.main --config ... run-benchmark --benchmarks gsm8k --lane behavior
         """
-        from run.pipelines.run_benchmark_acc import main as main_run_benchmark_acc
-        main_run_benchmark_acc(builder, benchmarks=benchmarks, max_samples=max_samples, lane=lane)
-
+        from run.pipelines.run_benchmark import main as main_run_benchmark
+        main_run_benchmark(
+            builder,
+            benchmarks=benchmarks,
+            max_samples=max_samples,
+            lane=lane,
+        )
+        
     @app.command()
     def run_benchmark_agent(benchmarks: str = None, max_samples: int = None):
         """
-        Example subcommand for benchmarking.
-        Usage: 
-            python custom.py run-benchmark --bench-name=mt-bench
+        Agent-task benchmark evaluation.
+        Usage:
+            python -m run.main --config ... run-benchmark-agent --benchmarks hotpotqa
         """
         from run.pipelines.run_benchmark_agent import main as main_run_benchmark_agent
         main_run_benchmark_agent(builder, benchmarks=benchmarks, max_samples=max_samples)

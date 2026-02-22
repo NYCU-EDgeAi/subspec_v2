@@ -49,7 +49,8 @@ class SubSpecSDGeneratorBase(ClassicSDGeneratorBase):
             with nvtx.annotate("postspec_refill", color="cyan"):
                 self.draft_model.init_postspec()
                 for _ in range(refill_steps):
-                    self.draft_model.postspec()
+                    if not self.draft_model.postspec():
+                        break
             tree = self.draft_model.update_tree_after_post()
             
         return tree
@@ -113,7 +114,7 @@ class SubSpecSDGeneratorBase(ClassicSDGeneratorBase):
         assert self.tokenizer is not None, "tokenizer must be provided"
 
         input_ids = input_ids.clone()
-        batch_size, org_input_len = input_ids.shape
+        batch_size, _ = input_ids.shape
         assert batch_size == 1, "Only support batch_size=1 for now."                                    
 
         # Raise error if max_length not set while using static cache
@@ -145,6 +146,10 @@ class SubSpecSDGeneratorBase(ClassicSDGeneratorBase):
             )
             next_token_logits = outputs.logits
             del outputs
+
+        remaining = self._remaining_token_budget(input_ids, stopping_criteria)
+        if remaining is not None and int(remaining) <= 0:
+            return input_ids
                 
         with nvtx.annotate("sample"):
             sampled_tokens = self._sample_token(next_token_logits, logits_processor, do_sample)
@@ -168,8 +173,11 @@ class SubSpecSDGeneratorBase(ClassicSDGeneratorBase):
             last_tree_depth = 0
 
             while not finished:
+                remaining = self._remaining_token_budget(input_ids, stopping_criteria)
+                if remaining is not None and int(remaining) <= 0:
+                    break
+
                 if is_prev_accepted:
-                    # self.post_verify_count += 1
                     skip_nodes = last_tree_size
                     cache_position = torch.arange(
                         position_offset + last_tree_size,
@@ -207,6 +215,22 @@ class SubSpecSDGeneratorBase(ClassicSDGeneratorBase):
                         dtype=torch.long,
                         device=input_ids.device,
                     )
+
+                decoded_tree_size = self._cap_tree_to_budget(
+                    tree,
+                    input_ids,
+                    stopping_criteria,
+                    skip_nodes=skip_nodes,
+                )
+                if decoded_tree_size <= 0:
+                    break
+                last_tree_size = tree.size()
+                cache_position = torch.arange(
+                    position_offset + skip_nodes,
+                    position_offset + skip_nodes + decoded_tree_size,
+                    dtype=torch.long,
+                    device=input_ids.device,
+                )
                         
                 with nvtx.annotate("target_decode", color="orange"):
                     self.draft_model.init_postspec()

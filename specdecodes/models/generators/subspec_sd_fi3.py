@@ -49,7 +49,9 @@ class SubSpecSDGeneratorBase(ClassicSDGeneratorBase):
 
         # Target model forward
         with nvtx.annotate("target_forward", color="red"):
-            num_tokens = self.draft_params.max_verify_tokens
+            num_tokens = int(tree_input_ids.shape[0])
+            if num_tokens == 0:
+                return None
             kvCachePool = request_kv_cache.kvCachePool
 
             batch_position = getKvCacheBatchPosition(
@@ -127,7 +129,7 @@ class SubSpecSDGeneratorBase(ClassicSDGeneratorBase):
         assert self.tokenizer is not None, "tokenizer must be provided"
 
         input_ids = input_ids.clone()
-        batch_size, org_input_len = input_ids.shape
+        batch_size, _ = input_ids.shape
         assert batch_size == 1, "Only support batch_size=1 for now."
 
         # Raise error if max_length not set while using static cache
@@ -174,33 +176,45 @@ class SubSpecSDGeneratorBase(ClassicSDGeneratorBase):
             next_token_logits = outputs.logits
             del outputs
 
+        remaining = self._remaining_token_budget(input_ids, stopping_criteria)
+        if remaining is not None and int(remaining) <= 0:
+            request_kv_cache.release()
+            return input_ids
+
         with nvtx.annotate("sample"):
             sampled_tokens = self._sample_token(next_token_logits, logits_processor, do_sample)
 
         with nvtx.annotate("state_update"):
             input_ids = torch.cat([input_ids, sampled_tokens], dim=-1)
-            cache_position = torch.arange(
-                org_input_len, org_input_len + self.draft_params.max_verify_tokens,
-                dtype=torch.long, device=input_ids.device
-            )
             self._maybe_stream(stream_callback, sampled_tokens)
 
         with nvtx.annotate("decode_loop"):
             finished = False
             while not finished:
+                remaining = self._remaining_token_budget(input_ids, stopping_criteria)
+                if remaining is not None and int(remaining) <= 0:
+                    break
+
                 with nvtx.annotate("speculate", color="cyan"):
                     last_token_id = sampled_tokens[:, -1:].clone(memory_format=torch.contiguous_format)
                     prev_kv_len = request_kv_cache.get_seq_length() + 1
                     tree = self._speculate(last_token_id, request_kv_cache)
+                    decoded_tree_size = self._cap_tree_to_budget(
+                        tree,
+                        input_ids,
+                        stopping_criteria,
+                    )
+                    if decoded_tree_size <= 0:
+                        break
 
                 with nvtx.annotate("target_decode", color="orange"):
                     outputs = self._tree_decoding(
                         tree, request_kv_cache,
                         position_offset=input_ids.shape[1] - 1,
-                        cache_position=cache_position,
+                        cache_position=None,
                         device=input_ids.device
                     )
-                    next_token_logits = outputs.logits
+                    next_token_logits = outputs.logits if outputs is not None else None
                     del outputs
 
                 with nvtx.annotate("verify"):
@@ -214,17 +228,24 @@ class SubSpecSDGeneratorBase(ClassicSDGeneratorBase):
                     del next_token_logits
 
                 with nvtx.annotate("kv_reorder"):
-                    num_new_tokens = self.draft_params.max_verify_tokens
+                    num_new_tokens = int(decoded_tree_size)
                     request_kv_cache.reorder_cache_with_offset(
                         hidden_indices, offset=prev_kv_len, num_new_tokens=num_new_tokens
                     )
 
                 with nvtx.annotate("state_update"):
                     input_ids = torch.cat([input_ids, sampled_tokens], dim=-1)
-                    cache_position += sampled_tokens.shape[1]
 
                 with nvtx.annotate("stop_check"):
-                    finished = stopping_criteria(input_ids, None).item()
+                    finished, input_ids, kept, prune_tokens = self._apply_tokenwise_stopping_criteria(
+                        input_ids=input_ids,
+                        sampled_tokens=sampled_tokens,
+                        stopping_criteria=stopping_criteria,
+                    )
+                if kept.numel() > 0:
+                    self._maybe_stream(stream_callback, kept)
+                if finished and int(prune_tokens) > 0:
+                    request_kv_cache.decrement(int(prune_tokens))
 
         request_kv_cache.release()
         return input_ids

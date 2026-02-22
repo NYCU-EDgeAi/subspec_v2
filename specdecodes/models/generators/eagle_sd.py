@@ -74,7 +74,7 @@ class EagleSDGeneratorBase(ClassicSDGeneratorBase):
         assert self.tokenizer is not None, "tokenizer must be provided"
 
         input_ids = input_ids.clone()
-        batch_size, org_input_len = input_ids.shape
+        batch_size, _ = input_ids.shape
         assert batch_size == 1, "Only support batch_size=1 for now."
 
         # Raise error if max_length not set while using static cache
@@ -110,26 +110,53 @@ class EagleSDGeneratorBase(ClassicSDGeneratorBase):
             hidden_states = outputs.hidden_states[-1]
             del outputs
 
+        remaining = self._remaining_token_budget(input_ids, stopping_criteria)
+        if remaining is not None and int(remaining) <= 0:
+            return input_ids
+
         with nvtx.annotate("sample"):
             sampled_tokens = self._sample_token(next_token_logits, logits_processor, do_sample)
 
         with nvtx.annotate("state_update"):
             input_ids = torch.cat([input_ids, sampled_tokens], dim=-1)
-            cache_position = torch.arange(org_input_len, org_input_len+self.draft_params.max_verify_tokens, dtype=torch.long, device=input_ids.device)
             self._maybe_stream(stream_callback, sampled_tokens)
 
         with nvtx.annotate("decode_loop"):
             finished = False
             while not finished:
+                remaining = self._remaining_token_budget(input_ids, stopping_criteria)
+                if remaining is not None and int(remaining) <= 0:
+                    break
+
                 with nvtx.annotate("speculate", color="cyan"):
                     tree = self._speculate(input_ids, hidden_states)
+                    decoded_tree_size = self._cap_tree_to_budget(
+                        tree,
+                        input_ids,
+                        stopping_criteria,
+                    )
+                    if decoded_tree_size <= 0:
+                        break
                     if self.cache_implementation == 'dynamic':
                         _, input_len = input_ids.shape
                         draft_past_key_values.crop(input_len-1)
 
                 with nvtx.annotate("target_decode", color="orange"):
                     prev_kv_len = past_key_values.get_seq_length()
-                    outputs = self._tree_decoding(tree, past_key_values, position_offset=input_ids.shape[1]-1, cache_position=cache_position, device=hidden_states.device)
+                    position_offset = int(input_ids.shape[1]) - 1
+                    cache_position = torch.arange(
+                        position_offset,
+                        position_offset + int(decoded_tree_size),
+                        dtype=torch.long,
+                        device=input_ids.device,
+                    )
+                    outputs = self._tree_decoding(
+                        tree,
+                        past_key_values,
+                        position_offset=position_offset,
+                        cache_position=cache_position,
+                        device=hidden_states.device,
+                    )
                     next_token_logits = outputs.logits
                     hidden_states = outputs.hidden_states[-1]
                     del outputs
@@ -151,7 +178,6 @@ class EagleSDGeneratorBase(ClassicSDGeneratorBase):
                 with nvtx.annotate("state_update"):
                     input_ids = torch.cat([input_ids, sampled_tokens], dim=-1)
                     hidden_states = hidden_states[:, hidden_indices].clone()
-                    cache_position += sampled_tokens.shape[1]
                 
                 with nvtx.annotate("stop_check"):
                     finished, input_ids, kept, prune_tokens = self._apply_tokenwise_stopping_criteria(
@@ -163,7 +189,12 @@ class EagleSDGeneratorBase(ClassicSDGeneratorBase):
                     self._maybe_stream(stream_callback, kept)
                  
                 with nvtx.annotate("kv_reorder"):
-                    past_key_values.reorder_cache_with_offset(hidden_indices, offset=prev_kv_len, new_chunk_len=self.draft_params.max_verify_tokens, dim=2)
+                    past_key_values.reorder_cache_with_offset(
+                        hidden_indices,
+                        offset=prev_kv_len,
+                        new_chunk_len=int(decoded_tree_size),
+                        dim=2,
+                    )
                     past_key_values.seq_len += hidden_indices.shape[0]
                     if finished:
                         past_key_values.seq_len -= prune_tokens

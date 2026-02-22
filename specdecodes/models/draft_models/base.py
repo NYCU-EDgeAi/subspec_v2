@@ -51,6 +51,8 @@ class TreeMaskCache:
         self.prefix_len = prefix_len
         self.sample_len = sample_len
         self.max_cache_len = max_cache_len
+        self.sample_len_int = int(sample_len)
+        self.max_cache_len_int = int(max_cache_len) if max_cache_len is not None else None
         self.dtype = dtype
         self.device = device
 
@@ -59,8 +61,8 @@ class TreeMaskCache:
         # current seq len), which would make the static mask too small and cause
         # shape mismatch errors during updates.
         use_static = (
-            self.max_cache_len is not None
-            and int(self.max_cache_len) >= int(self.prefix_len) + int(self.sample_len)
+            self.max_cache_len_int is not None
+            and self.max_cache_len_int >= int(self.prefix_len) + self.sample_len_int
         )
 
         # build static tree_mask
@@ -77,7 +79,7 @@ class TreeMaskCache:
             
             # Initialize the first `prefix_len` elements to True
             self.tree_mask_cache[:, :, 0, :self.prefix_len] = True
-            self.current_len = self.prefix_len
+            self.current_len = int(self.prefix_len)
             
         # build dynamic tree_mask instead
         else:
@@ -88,16 +90,20 @@ class TreeMaskCache:
                 dtype=torch.bool
             )
         # Create an identity block for later use
-        self.eye_block = torch.eye(self.sample_len, device=self.device, dtype=torch.bool).unsqueeze(0).unsqueeze(0)
+        self.eye_block = torch.eye(self.sample_len_int, device=self.device, dtype=torch.bool).unsqueeze(0).unsqueeze(0)
 
     def update_tree_mask(self, parent_indices: torch.Tensor,return_invert:bool=True) -> torch.Tensor:
         if self.tree_mask_update_method == 'static': # static tree mask update
             # Update existing mask based on parent indices
             self.tree_mask_cache[..., :self.current_len] = self.tree_mask_cache[..., parent_indices[0], :self.current_len]
-            # Append the eye_block to the mask
-            self.tree_mask_cache[..., self.current_len:self.current_len + self.sample_len] = self.eye_block
-            # Update the current length
-            self.current_len += self.sample_len
+            # Append identity block only within remaining static-cache width.
+            start = self.current_len
+            remaining = self.max_cache_len_int - start
+            if remaining > 0:
+                append_width = self.sample_len_int if self.sample_len_int <= remaining else remaining
+                end = start + append_width
+                self.tree_mask_cache[..., start:end] = self.eye_block[..., :append_width]
+                self.current_len = end
         else: 
             # Dynamically expand the mask by concatenating the eye_block
             tree_mask = self.tree_mask_cache[:, :, parent_indices[0]]
@@ -327,6 +333,60 @@ class DraftModelBase(nn.Module):
         
     def get_tree(self):
         return self.tree
+
+    def _get_static_cache_limit(self, request_kv_cache=None) -> Optional[int]:
+        """Return static cache capacity if known; otherwise `None`."""
+        past = getattr(self, "past_key_values", None)
+        cache = getattr(past, "cache", None) if past is not None else None
+        max_cache_len = getattr(cache, "max_cache_len", None) if cache is not None else None
+        if max_cache_len is not None:
+            return int(max_cache_len)
+
+        req = request_kv_cache
+        if req is None:
+            req = getattr(self, "request_kv_cache", None)
+        if req is None:
+            req = getattr(self, "_request_kv_cache", None)
+        if req is None:
+            return None
+
+        pool = getattr(req, "kvCachePool", None)
+        if pool is None:
+            return None
+
+        max_pages = getattr(pool, "max_pages", None)
+        page_len = getattr(pool, "page_len", None)
+        if max_pages is None or page_len is None:
+            return None
+        return int(max_pages) * int(page_len)
+
+    def _has_postspec_headroom(
+        self,
+        *,
+        step_tokens: int = 1,
+        cache_position: Optional[torch.Tensor] = None,
+        request_kv_cache=None,
+    ) -> bool:
+        """Check whether one postspec step can run without exceeding static cache."""
+        limit = self._get_static_cache_limit(request_kv_cache=request_kv_cache)
+        if limit is None:
+            return True
+
+        if request_kv_cache is not None:
+            next_len = int(request_kv_cache.get_seq_length()) + int(step_tokens)
+            return next_len <= int(limit)
+
+        cache_pos = cache_position
+        if cache_pos is None:
+            cache_pos = getattr(self, "cache_position", None)
+        if isinstance(cache_pos, torch.Tensor) and cache_pos.numel() > 0:
+            return int(torch.max(cache_pos).item()) < int(limit)
+
+        # Fallback when no explicit positions are tracked.
+        past = getattr(self, "past_key_values", None)
+        if past is not None:
+            return int(self._get_kv_len_int()) + int(step_tokens) <= int(limit)
+        return True
 
     def _get_kv_len_int(self) -> int:
         kv_len = self.past_key_values.get_seq_length()

@@ -154,8 +154,14 @@ class SubSpecSDDraftModel(DraftModelBase):
                     parent_indices, return_invert=False
                 )
 
+            num_tokens = int(self.draft_params.topk_len)
+            if not self._has_postspec_headroom(
+                step_tokens=num_tokens,
+                request_kv_cache=request_kv_cache,
+            ):
+                break
+
             with nvtx.annotate("draft_forward", color="red"):
-                num_tokens = self.draft_params.topk_len
                 request_kv_cache.increment(num_tokens)
 
                 batch_position = getKvCacheBatchPosition(
@@ -209,10 +215,18 @@ class SubSpecSDDraftModel(DraftModelBase):
     def postspec(self):
         """Post-speculation step (called during target model forward)."""
         if self._count == 0 or self._postspec_count > self.draft_params.max_depth - 1:
-            return
+            return False
+        if not self._has_postspec_headroom(
+            step_tokens=int(self.draft_params.topk_len),
+            request_kv_cache=getattr(self, "_request_kv_cache", None),
+        ):
+            return False
         with nvtx.annotate("postspec_step", color="blue"):
-            self._speculate_once()
+            progressed = self._speculate_once()
+        if not progressed:
+            return False
         self._postspec_count += 1
+        return True
 
     @torch.no_grad()
     def _speculate_once(self):
@@ -222,9 +236,14 @@ class SubSpecSDDraftModel(DraftModelBase):
         parent_probs = self._parent_probs
         position_ids = self._position_ids
         request_kv_cache = self._request_kv_cache
+        num_tokens = int(self.draft_params.topk_len)
+        if not self._has_postspec_headroom(
+            step_tokens=num_tokens,
+            request_kv_cache=request_kv_cache,
+        ):
+            return False
 
         with nvtx.annotate("draft_forward", color="red"):
-            num_tokens = self.draft_params.topk_len
             request_kv_cache.increment(num_tokens)
 
             batch_position = getKvCacheBatchPosition(
@@ -260,6 +279,7 @@ class SubSpecSDDraftModel(DraftModelBase):
         self._token_ids = token_ids
         self._parent_probs = child_probs
         self._position_ids += 1
+        return True
 
     def update_tree_after_post(self) -> Tree:
         """Return finalized tree after post-speculation."""

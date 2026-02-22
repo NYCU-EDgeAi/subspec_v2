@@ -18,17 +18,8 @@ def flashinfer_load_kv_cache(builder, target_model, draft_model):
     if builder.max_length is None:
         raise ValueError("max_length should be set for FlashInfer cache.")
 
-    # Shared logic for max_cache_len calculation
-    max_verify_tokens = 0
-    if builder.draft_params:
-        if hasattr(builder.draft_params, "max_verify_tokens"):
-            max_verify_tokens = builder.draft_params.max_verify_tokens
-        elif hasattr(builder.draft_params, "max_sample_tokens"):
-            max_verify_tokens = builder.draft_params.max_sample_tokens
-        elif hasattr(builder.draft_params, "num_nodes"):
-            max_verify_tokens = builder.draft_params.num_nodes + 1
-
-    max_cache_len = builder.max_length + max_verify_tokens
+    # `max_length` is the hard upper bound for static cache capacity.
+    max_cache_len = int(builder.max_length)
 
     past_key_values = FlashInferCache(
         target_model.config, max_tokens=max_cache_len, PAGE_LEN=max_cache_len
@@ -139,17 +130,8 @@ def flashinfer_load_kv_cache_v3(builder, target_model, draft_model):
     if builder.max_length is None:
         raise ValueError("max_length should be set for FlashInfer cache.")
 
-    # Shared logic for max_cache_len calculation
-    max_verify_tokens = 0
-    if builder.draft_params:
-        if hasattr(builder.draft_params, "max_verify_tokens"):
-            max_verify_tokens = builder.draft_params.max_verify_tokens
-        elif hasattr(builder.draft_params, "max_sample_tokens"):
-            max_verify_tokens = builder.draft_params.max_sample_tokens
-        elif hasattr(builder.draft_params, "num_nodes"):
-            max_verify_tokens = builder.draft_params.num_nodes + 1
-
-    max_cache_len = builder.max_length + max_verify_tokens
+    # `max_length` is the hard upper bound for static cache capacity.
+    max_cache_len = int(builder.max_length)
 
     # Match v1's PAGE_LEN approach (single large page = max_cache_len)
     # This simplifies KV cache management to just 1 page

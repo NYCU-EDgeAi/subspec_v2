@@ -8,20 +8,7 @@ from ..utils.mixin import SDProfilingMixin
 
 class KVRewriteGeneratorBase(ClassicSDGeneratorBase):
     def _verify(self, draft_ids, root_ind, logits, logits_processor, do_sample, skip_nodes: int = 0):
-        # global_ids = self._sample_token(logits, logits_processor, do_sample, return_probs=False)  # [1, T]
-        # g0 = global_ids[0] # [T]
-        # d = draft_ids[0][root_ind:root_ind + g0.size(0)] # [T]
-
-        # valid = (d[1:] == g0[:-1]) & (g0[:-1] != self.draft_model.eos_token_id)
-        # accept_len = int(torch.cumprod(valid.to(torch.int64), dim=0).sum().item())
-        # cmp_len = g0.size(0) - 1
-        # total_len = cmp_len if accept_len == cmp_len else accept_len + 1
-
-        # sampled_tokens = g0[:accept_len + 1]
-
-        # return sampled_tokens.unsqueeze(0), None, (total_len, accept_len)
-        
-        # accept all
+        # KV rewrite accepts the entire drafted block.
         accept_len = draft_ids.shape[1] - 1
         total_len = accept_len + 1
         sampled_tokens = draft_ids[:, :total_len]
@@ -59,7 +46,7 @@ class KVRewriteGeneratorBase(ClassicSDGeneratorBase):
         assert self.tokenizer is not None, "tokenizer must be provided"
 
         input_ids = input_ids.clone()
-        batch_size, org_input_len = input_ids.shape
+        batch_size, _ = input_ids.shape
         assert batch_size == 1, "Only support batch_size=1 for now."
 
         # Raise error if max_length not set while using static cache
@@ -88,6 +75,10 @@ class KVRewriteGeneratorBase(ClassicSDGeneratorBase):
             next_token_logits = outputs.logits
             del outputs
 
+        remaining = self._remaining_token_budget(input_ids, stopping_criteria)
+        if remaining is not None and int(remaining) <= 0:
+            return input_ids
+
         with nvtx.annotate("sample"):
             sampled_tokens = self._sample_token(next_token_logits, logits_processor, do_sample)
 
@@ -109,9 +100,14 @@ class KVRewriteGeneratorBase(ClassicSDGeneratorBase):
         with nvtx.annotate("decode_loop"):
             finished = False
             while not finished:
-                # with nvtx.annotate("speculate", color="cyan"):
-                #     last_token_id = sampled_tokens[:, -1:].clone(memory_format=torch.contiguous_format)
-                #     draft_ids = self._speculate(last_token_id)
+                remaining = self._remaining_token_budget(input_ids, stopping_criteria)
+                if remaining is not None and int(remaining) <= 0:
+                    break
+                draft_ids = self._cap_draft_ids_to_budget(
+                    draft_ids,
+                    input_ids,
+                    stopping_criteria,
+                )
                 
                 with nvtx.annotate("target_decode", color="orange"):
                     # Recompute decode positions from the current committed prefix and

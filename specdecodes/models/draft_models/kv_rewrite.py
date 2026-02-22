@@ -87,7 +87,8 @@ class SubSpecSDDraftModel(ClassicSDDraftModel):
 
         # 5) Main loop
         for depth_i in range(depth-1):
-            self.speculate_once()
+            if not self.speculate_once():
+                break
 
         return torch.cat(self.token_ids, dim=-1)
     
@@ -100,15 +101,15 @@ class SubSpecSDDraftModel(ClassicSDDraftModel):
             return False
         if self.postspec_count > (self.draft_params.max_depth - 1):
             return False
-        max_cache_len = getattr(self.past_key_values.cache, "max_cache_len", None)
-        if max_cache_len is not None:
-            cache_pos = getattr(self, "cache_position", None)
-            if isinstance(cache_pos, torch.Tensor) and cache_pos.numel() > 0:
-                # Guard against out-of-bounds writes to static KV cache.
-                if int(torch.max(cache_pos).item()) >= int(max_cache_len):
-                    return False
+        if not self._has_postspec_headroom(
+            step_tokens=int(getattr(self, "cache_position", torch.empty(0)).numel()),
+            cache_position=getattr(self, "cache_position", None),
+        ):
+            return False
         with nvtx.annotate("postspec_step", color="blue"):
-            self.speculate_once()
+            progressed = self.speculate_once()
+        if not progressed:
+            return False
         self.postspec_count += 1
         return True
         

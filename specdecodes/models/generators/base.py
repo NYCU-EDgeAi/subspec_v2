@@ -297,6 +297,67 @@ class GeneratorBase(nn.Module):
             else sampled_tokens[:, : sampled_tokens.shape[1] - prune_tokens]
         )
         return finished, input_ids, kept, prune_tokens
+
+    def _remaining_token_budget(
+        self,
+        input_ids: torch.LongTensor,
+        stopping_criteria: StoppingCriteria,
+    ):
+        """Return remaining new-token budget until `max_length` (None if unbounded)."""
+        max_length = getattr(stopping_criteria, "max_length", None)
+        if max_length is None:
+            return None
+        return max(0, int(max_length) - int(input_ids.shape[1]))
+
+    def _candidate_decode_budget(
+        self,
+        input_ids: torch.LongTensor,
+        stopping_criteria: StoppingCriteria,
+    ):
+        """Max candidate nodes/timesteps we may decode this step without KV overflow.
+
+        Candidate decode includes one boundary/root context token, so budget is
+        `remaining_new_tokens + 1` when `max_length` is bounded.
+        """
+        remaining = self._remaining_token_budget(input_ids, stopping_criteria)
+        if remaining is None:
+            return None
+        return max(1, int(remaining) + 1)
+
+    def _cap_draft_ids_to_budget(
+        self,
+        draft_ids: torch.LongTensor,
+        input_ids: torch.LongTensor,
+        stopping_criteria: StoppingCriteria,
+    ):
+        budget = self._candidate_decode_budget(input_ids, stopping_criteria)
+        if budget is None:
+            return draft_ids
+        if int(draft_ids.shape[1]) <= int(budget):
+            return draft_ids
+        return draft_ids[:, : int(budget)]
+
+    def _cap_tree_to_budget(
+        self,
+        tree,
+        input_ids: torch.LongTensor,
+        stopping_criteria: StoppingCriteria,
+        *,
+        skip_nodes: int = 0,
+    ) -> int:
+        """Truncate tree to fit this step's decode budget and return decoded node count."""
+        budget = self._candidate_decode_budget(input_ids, stopping_criteria)
+        if budget is None:
+            return max(0, int(tree.size()) - int(skip_nodes))
+
+        max_tree_nodes = int(skip_nodes) + int(budget)
+        if int(tree.size()) > max_tree_nodes:
+            if hasattr(tree, "truncate_prefix"):
+                tree.truncate_prefix(max_tree_nodes)
+            else:
+                tree.prune_to_top_n(max_tree_nodes)
+
+        return max(0, int(tree.size()) - int(skip_nodes))
     
     def create_kv_cache(
         self,
