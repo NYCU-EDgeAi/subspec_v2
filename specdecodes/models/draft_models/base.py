@@ -1,12 +1,13 @@
-import torch
-import torch.nn as nn
-from transformers import AutoModelForCausalLM
-from transformers.utils import is_torchdynamo_compiling
-from safetensors.torch import load_model
-from typing import List, Tuple, Optional, Dict
 import logging
 import os
+from typing import Dict, List, Optional, Tuple
+
 import nvtx
+import torch
+import torch.nn as nn
+from safetensors.torch import load_model
+from transformers import AutoModelForCausalLM
+from transformers.utils import is_torchdynamo_compiling
 
 from ..utils.utils import invert_mask
 
@@ -14,19 +15,22 @@ from ..utils.utils import invert_mask
 def load_custom_model(model, model_path, remove_embeddings=False):
     # Load the model
     missing_keys, unexpected_keys = load_model(model, model_path, strict=False)
-    
+
     # Remove embed_tokens if not found (for custom models that uses LLM's embed_tokens)
     for key in missing_keys:
-        if 'embed_tokens' in key:
+        if "embed_tokens" in key:
             logging.info("embed_tokens not found. Use LLM's embed_tokens instead.")
             if remove_embeddings:
                 del model.model.embed_tokens
-    missing_keys = [key for key in missing_keys if 'embed_tokens' not in key]
-    
+    missing_keys = [key for key in missing_keys if "embed_tokens" not in key]
+
     # error handling
-    assert len(missing_keys) == 0 and len(unexpected_keys) == 0, f"Missing keys: {missing_keys}, Unexpected keys: {unexpected_keys}"
-    
+    assert len(missing_keys) == 0 and len(unexpected_keys) == 0, (
+        f"Missing keys: {missing_keys}, Unexpected keys: {unexpected_keys}"
+    )
+
     return model
+
 
 class TreeData(nn.Module):
     def __init__(self):
@@ -34,23 +38,37 @@ class TreeData(nn.Module):
         self.token_ids_data = []
         self.child_probs_data = []
         self.parent_indices_data = []
-        
-    def update(self, token_ids: torch.Tensor, child_probs: torch.Tensor, parent_indices: torch.Tensor) -> torch.Tensor:
+
+    def update(
+        self,
+        token_ids: torch.Tensor,
+        child_probs: torch.Tensor,
+        parent_indices: torch.Tensor,
+    ) -> None:
         self.token_ids_data.append(token_ids)
         self.child_probs_data.append(child_probs)
         self.parent_indices_data.append(parent_indices)
-    
+
+    def has_data(self) -> bool:
+        return len(self.token_ids_data) > 0
+
     def get_data(self):
         token_ids_data = torch.cat(self.token_ids_data, dim=0).unsqueeze(0)
         child_probs_data = torch.cat(self.child_probs_data, dim=0).unsqueeze(0)
         parent_indices_data = torch.cat(self.parent_indices_data, dim=0).unsqueeze(0)
-        return (token_ids_data, child_probs_data, parent_indices_data)
-    
+        return token_ids_data, child_probs_data, parent_indices_data
+
+
 class TreeMaskCache:
-    def __init__(self, prefix_len: int, sample_len: int, max_cache_len: int, dtype: str, device: str):
-        self.prefix_len = prefix_len
-        self.sample_len = sample_len
-        self.max_cache_len = max_cache_len
+    def __init__(
+        self,
+        prefix_len: int,
+        sample_len: int,
+        max_cache_len: Optional[int],
+        dtype: str,
+        device: str,
+    ):
+        self.prefix_len = int(prefix_len)
         self.sample_len_int = int(sample_len)
         self.max_cache_len_int = int(max_cache_len) if max_cache_len is not None else None
         self.dtype = dtype
@@ -62,61 +80,66 @@ class TreeMaskCache:
         # shape mismatch errors during updates.
         use_static = (
             self.max_cache_len_int is not None
-            and self.max_cache_len_int >= int(self.prefix_len) + self.sample_len_int
+            and self.max_cache_len_int >= self.prefix_len + self.sample_len_int
         )
 
-        # build static tree_mask
         if use_static:
-            self.tree_mask_update_method = 'static'
+            self.tree_mask_update_method = "static"
             self.tree_mask_cache = torch.zeros(
-                (1, 1, self.sample_len, self.max_cache_len),
+                (1, 1, self.sample_len_int, self.max_cache_len_int),
                 device=self.device,
-                dtype=torch.bool
+                dtype=torch.bool,
             )
             if not is_torchdynamo_compiling():
                 # Mark the buffer's address as static for optimization purposes
                 torch._dynamo.mark_static_address(self.tree_mask_cache)
-            
+
             # Initialize the first `prefix_len` elements to True
             self.tree_mask_cache[:, :, 0, :self.prefix_len] = True
-            self.current_len = int(self.prefix_len)
-            
-        # build dynamic tree_mask instead
+            self.current_len = self.prefix_len
+
         else:
-            self.tree_mask_update_method = 'dynamic'
+            self.tree_mask_update_method = "dynamic"
             self.tree_mask_cache = torch.ones(
                 (1, 1, 1, self.prefix_len),
                 device=self.device,
-                dtype=torch.bool
+                dtype=torch.bool,
             )
         # Create an identity block for later use
-        self.eye_block = torch.eye(self.sample_len_int, device=self.device, dtype=torch.bool).unsqueeze(0).unsqueeze(0)
+        self.eye_block = (
+            torch.eye(self.sample_len_int, device=self.device, dtype=torch.bool)
+            .unsqueeze(0)
+            .unsqueeze(0)
+        )
 
-    def update_tree_mask(self, parent_indices: torch.Tensor,return_invert:bool=True) -> torch.Tensor:
-        if self.tree_mask_update_method == 'static': # static tree mask update
+    def update_tree_mask(
+        self, parent_indices: torch.Tensor, return_invert: bool = True
+    ) -> torch.Tensor:
+        if self.tree_mask_update_method == "static":
             # Update existing mask based on parent indices
-            self.tree_mask_cache[..., :self.current_len] = self.tree_mask_cache[..., parent_indices[0], :self.current_len]
+            self.tree_mask_cache[..., : self.current_len] = self.tree_mask_cache[
+                ..., parent_indices[0], : self.current_len
+            ]
             # Append identity block only within remaining static-cache width.
             start = self.current_len
             remaining = self.max_cache_len_int - start
             if remaining > 0:
-                append_width = self.sample_len_int if self.sample_len_int <= remaining else remaining
+                append_width = min(self.sample_len_int, remaining)
                 end = start + append_width
                 self.tree_mask_cache[..., start:end] = self.eye_block[..., :append_width]
                 self.current_len = end
-        else: 
+        else:
             # Dynamically expand the mask by concatenating the eye_block
             tree_mask = self.tree_mask_cache[:, :, parent_indices[0]]
             self.tree_mask_cache = torch.concat((tree_mask, self.eye_block), dim=3)
-        
+
         # Invert the mask and return
         if return_invert:
             return invert_mask(self.tree_mask_cache, dtype=self.dtype)
         else:
             return self.tree_mask_cache
-    
-    # return Inverted tree mask (same as update_tree_mask output)
-    def get_tree_mask(self, return_invert:bool=True):
+
+    def get_tree_mask(self, return_invert: bool = True) -> torch.Tensor:
         if return_invert:
             return invert_mask(self.tree_mask_cache, dtype=self.dtype)
         else:

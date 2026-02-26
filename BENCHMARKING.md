@@ -26,6 +26,7 @@ Unsupported tasks fail fast before model build.
 
 - Generation-based scoring (exercises decoding behavior, including SD paths).
 - Used for SD behavior-change analysis.
+- `mt-bench` is supported for multi-turn generation behavior/perf evaluation.
 - In compare mode, reports task-native accuracy + flips for:
   - `gsm8k`
   - `human-eval`
@@ -40,7 +41,7 @@ Unsupported tasks fail fast before model build.
 ## Recommended Benchmark Sets
 
 - **Distribution lane (MC):** `hellaswag,piqa,arc-c,winogrande`
-- **Behavior lane (decode-dominant):** `gsm8k,human-eval-instruct`
+- **Behavior lane (decode-dominant):** `mt-bench,gsm8k,human-eval-instruct`
 
 ## Commands
 

@@ -180,6 +180,8 @@ class SubSpecSDDraftModel(DraftModelBase):
     
     @torch.no_grad()
     def update_tree(self, tree_data):
+        if not tree_data.has_data():
+            return self.tree
         with nvtx.annotate("tree_finalize"):
             with nvtx.annotate("tree_data/get"):
                 data = tree_data.get_data()
@@ -277,12 +279,6 @@ class SubSpecSDDraftModel(DraftModelBase):
                 )
                 
                 parent_probs = child_probs
-                
-            with nvtx.annotate("tree_data/update", color="green"):
-                self.tree_data.update(token_ids, child_probs, parent_indices)
-                
-            with nvtx.annotate("tree_mask/update"):
-                tree_attention_mask = self.tree_mask_cache.update_tree_mask(parent_indices,return_invert=False)
 
             num_tokens = int(self.draft_params.topk_len)
             if not self._has_postspec_headroom(
@@ -290,6 +286,15 @@ class SubSpecSDDraftModel(DraftModelBase):
                 request_kv_cache=request_kv_cache,
             ):
                 break
+
+            with nvtx.annotate("tree_data/update", color="green"):
+                self.tree_data.update(token_ids, child_probs, parent_indices)
+
+            with nvtx.annotate("tree_mask/update"):
+                tree_attention_mask = self.tree_mask_cache.update_tree_mask(
+                    parent_indices,
+                    return_invert=False,
+                )
                 
             with nvtx.annotate("draft_forward", color="red"):
                 request_kv_cache.increment(num_tokens)

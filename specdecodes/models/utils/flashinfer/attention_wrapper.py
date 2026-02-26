@@ -32,7 +32,13 @@ def find_padded_head_dim(head_dim):
 
 class FlashinferAttentionWrapper:
     def __init__(
-        self, num_attention_heads: int, num_key_value_heads: int, hidden_size: int, page_len:int,
+        self,
+        num_attention_heads: int,
+        num_key_value_heads: int,
+        hidden_size: int,
+        page_len: int,
+        *,
+        tree_use_cuda_graph: bool = True,
     ):
         self.hidden_size = hidden_size
         self.num_attention_heads = num_attention_heads
@@ -40,6 +46,7 @@ class FlashinferAttentionWrapper:
         self.head_dim = hidden_size // num_attention_heads
         self._head_padded_dim = find_padded_head_dim(self.head_dim)
         self.page_len = page_len
+        self.tree_use_cuda_graph = bool(tree_use_cuda_graph)
 
         self.group_size = self.num_attention_heads // self.num_key_value_heads
         _workspace_buffer = torch.empty(
@@ -56,62 +63,56 @@ class FlashinferAttentionWrapper:
             
         )
 
-        self.tree_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
-            float_workspace_buffer=_workspace_buffer, kv_layout="NHD"
-        )
-        
-        # for cuda grapth
-        batch_size = 1
-        
-        self.qo_indptr_buf = torch.zeros(
-            (batch_size + 1,),  # Typically 2 for batch=1
-            dtype=torch.int32,
-            device=torch.cuda.current_device()
-        )
-
-        self.paged_kv_indptr_buf = torch.zeros(
-            (batch_size + 1,),  # Also 2
-            dtype=torch.int32,
-            device=torch.cuda.current_device()
-        )
-
-        self.paged_kv_indices_buf = torch.zeros(
-            1024,              # Example size; tune to your max seq length / heads
-            dtype=torch.int32,
-            device=torch.cuda.current_device()
-        )
-
-        self.paged_kv_last_page_len_buf = torch.zeros(
-            (batch_size,),     # 1
-            dtype=torch.int32,
-            device=torch.cuda.current_device()
-        )
-
-        # If you do not use custom masks, you can omit these;
-        # otherwise, set them as large as the max needed for your custom mask.
-        self.custom_mask_buf = torch.zeros(
-            100000*1000,  # Must be >= packed_mask.numel() to avoid OOB.
-            dtype=torch.uint8,
-            device=torch.cuda.current_device()
-        )
-        
-        self.mask_indptr_buf = torch.zeros(
-            (batch_size + 1,),  # Also 2
-            dtype=torch.int32,
-            device=torch.cuda.current_device()
-        )
-        
-        self.tree_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
-            float_workspace_buffer=_workspace_buffer,
-            kv_layout="NHD",
-            use_cuda_graph=True,  # <-- The critical toggle
-            qo_indptr_buf=self.qo_indptr_buf,
-            paged_kv_indptr_buf=self.paged_kv_indptr_buf,
-            paged_kv_indices_buf=self.paged_kv_indices_buf,
-            paged_kv_last_page_len_buf=self.paged_kv_last_page_len_buf,
-            custom_mask_buf=self.custom_mask_buf,
-            mask_indptr_buf=self.mask_indptr_buf,
-        )
+        if self.tree_use_cuda_graph:
+            # FlashInfer tree wrapper in CUDA-graph mode has a fixed row budget
+            # tied to the first plan() call.
+            batch_size = 1
+            self.qo_indptr_buf = torch.zeros(
+                (batch_size + 1,),
+                dtype=torch.int32,
+                device=torch.cuda.current_device(),
+            )
+            self.paged_kv_indptr_buf = torch.zeros(
+                (batch_size + 1,),
+                dtype=torch.int32,
+                device=torch.cuda.current_device(),
+            )
+            self.paged_kv_indices_buf = torch.zeros(
+                1024,
+                dtype=torch.int32,
+                device=torch.cuda.current_device(),
+            )
+            self.paged_kv_last_page_len_buf = torch.zeros(
+                (batch_size,),
+                dtype=torch.int32,
+                device=torch.cuda.current_device(),
+            )
+            self.custom_mask_buf = torch.zeros(
+                100000 * 1000,
+                dtype=torch.uint8,
+                device=torch.cuda.current_device(),
+            )
+            self.mask_indptr_buf = torch.zeros(
+                (batch_size + 1,),
+                dtype=torch.int32,
+                device=torch.cuda.current_device(),
+            )
+            self.tree_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+                float_workspace_buffer=_workspace_buffer,
+                kv_layout="NHD",
+                use_cuda_graph=True,
+                qo_indptr_buf=self.qo_indptr_buf,
+                paged_kv_indptr_buf=self.paged_kv_indptr_buf,
+                paged_kv_indices_buf=self.paged_kv_indices_buf,
+                paged_kv_last_page_len_buf=self.paged_kv_last_page_len_buf,
+                custom_mask_buf=self.custom_mask_buf,
+                mask_indptr_buf=self.mask_indptr_buf,
+            )
+        else:
+            self.tree_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+                float_workspace_buffer=_workspace_buffer,
+                kv_layout="NHD",
+            )
 
     def prepareAttention(
         self,

@@ -1,4 +1,4 @@
-"""SubSpec recipe: HQQ 4-bit quant (attn + MLP) with postspec-overlap offloading."""
+"""KV rewrite recipe: HQQ 4-bit quantization for attention and MLP layers."""
 
 from ..base_recipe import QuantOffloadRecipe
 from hqq.core.quantize import *

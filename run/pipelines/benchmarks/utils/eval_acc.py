@@ -143,6 +143,9 @@ def _init_perf():
         "total_iter": 0,
         "total_draft_time": 0.0,
         "total_target_time": 0.0,
+        "total_verify_nonterminal_rounds": 0,
+        "total_verify_nonterminal_weighted_accept_sum": 0.0,
+        "total_verify_nonterminal_weighted_second_moment_sum": 0.0,
     }
 
 
@@ -154,6 +157,22 @@ def _accum_perf(perf, record):
     perf["total_draft_time"] += record["avg_draft_time"] * n_iter
     perf["total_target_time"] += record["avg_target_time"] * n_iter
 
+    verify_nonterminal_rounds = int(record.get("verify_nonterminal_rounds", 0) or 0)
+    mean_verify_accept_len_nonterminal = float(
+        record.get("mean_verify_accept_len_nonterminal", 0.0) or 0.0
+    )
+    std_verify_accept_len_nonterminal = float(
+        record.get("std_verify_accept_len_nonterminal", 0.0) or 0.0
+    )
+    perf["total_verify_nonterminal_rounds"] += verify_nonterminal_rounds
+    perf["total_verify_nonterminal_weighted_accept_sum"] += (
+        mean_verify_accept_len_nonterminal * verify_nonterminal_rounds
+    )
+    perf["total_verify_nonterminal_weighted_second_moment_sum"] += (
+        (std_verify_accept_len_nonterminal ** 2 + mean_verify_accept_len_nonterminal ** 2)
+        * verify_nonterminal_rounds
+    )
+
 
 def _finalize_perf(perf, generator):
     tput_list = perf["tput_list"]
@@ -161,12 +180,31 @@ def _finalize_perf(perf, generator):
     total_iter = perf["total_iter"]
     total_draft_time = perf["total_draft_time"]
     total_target_time = perf["total_target_time"]
+    total_verify_nonterminal_rounds = int(perf["total_verify_nonterminal_rounds"])
+    total_verify_nonterminal_weighted_accept_sum = float(
+        perf["total_verify_nonterminal_weighted_accept_sum"]
+    )
+    total_verify_nonterminal_weighted_second_moment_sum = float(
+        perf["total_verify_nonterminal_weighted_second_moment_sum"]
+    )
 
     tput_mean, tput_std = (np.mean(tput_list), np.std(tput_list)) if tput_list else (0, 0)
     tacc_mean, tacc_std = (np.mean(tacc_list), np.std(tacc_list)) if tacc_list else (0, 0)
     avg_draft_time = (total_draft_time / total_iter) if total_iter > 0 else 0
     avg_target_time = (total_target_time / total_iter) if total_iter > 0 else 0
     peak_memory = torch.cuda.max_memory_reserved(generator.device) / (1024 ** 3)
+    mean_verify_accept_len_nonterminal = (
+        float(total_verify_nonterminal_weighted_accept_sum / total_verify_nonterminal_rounds)
+        if total_verify_nonterminal_rounds > 0
+        else 0.0
+    )
+    std_verify_accept_len_nonterminal = 0.0
+    if total_verify_nonterminal_rounds > 0:
+        second_moment = float(
+            total_verify_nonterminal_weighted_second_moment_sum / total_verify_nonterminal_rounds
+        )
+        variance = max(0.0, second_moment - mean_verify_accept_len_nonterminal ** 2)
+        std_verify_accept_len_nonterminal = float(variance ** 0.5)
 
     return {
         "tput_mean": float(tput_mean),
@@ -176,6 +214,9 @@ def _finalize_perf(perf, generator):
         "avg_draft_time": float(avg_draft_time),
         "avg_target_time": float(avg_target_time),
         "peak_memory_gib": float(peak_memory),
+        "verify_nonterminal_rounds": total_verify_nonterminal_rounds,
+        "mean_verify_accept_len_nonterminal": float(mean_verify_accept_len_nonterminal),
+        "std_verify_accept_len_nonterminal": float(std_verify_accept_len_nonterminal),
     }
 
 
@@ -190,7 +231,13 @@ def _print_summary(
 ):
     print(f"Final {title} Results:")
     print(f"\tThroughput       : {perf_stats['tput_mean']:.3f} ± {perf_stats['tput_std']:.3f} tokens/sec")
-    print(f"\tToken Acceptance : {perf_stats['tacc_mean']:.3f} ± {perf_stats['tacc_std']:.3f}")
+    print(f"\tToken Acceptance : {perf_stats['tacc_mean']:.3f} ± {perf_stats['tacc_std']:.3f} (avg_sampled)")
+    if int(perf_stats.get("verify_nonterminal_rounds", 0)) > 0:
+        print(
+            f"\tVerify Accept Len (nonterminal): {perf_stats['mean_verify_accept_len_nonterminal']:.3f} "
+            f"± {perf_stats['std_verify_accept_len_nonterminal']:.3f} "
+            f"tokens/verify ({int(perf_stats['verify_nonterminal_rounds'])} rounds)"
+        )
     if accuracy is not None:
         if correct_q is not None and total_q is not None:
             print(f"\tAnswer Accuracy  : {accuracy:.3f} ({correct_q}/{total_q})")
@@ -207,6 +254,32 @@ def _print_summary(
         print(f"\tAvg Draft Time   : {perf_stats['avg_draft_time']:.3f} sec")
     print(f"\tAvg Target Time  : {perf_stats['avg_target_time']:.3f} sec")
     print(f"\tPeak Memory      : {perf_stats['peak_memory_gib']:.3f} GiB")
+
+
+# ---- MT-Bench ------------------------------------------------------------
+def run_mtbench_eval(
+    generator,
+    tokenizer,
+    past_key_values,
+    draft_past_key_values,
+    args,
+    dataset,
+    log_dir,
+):
+    """Evaluate multi-turn MT-Bench (generation-only; no reference accuracy)."""
+    # Reuse the legacy multi-turn evaluator implementation to preserve behavior.
+    from .eval import run_mtbench_eval as _run_mtbench_eval_legacy
+
+    return _run_mtbench_eval_legacy(
+        generator,
+        tokenizer,
+        past_key_values,
+        draft_past_key_values,
+        args,
+        dataset,
+        log_dir,
+    )
+
 
 # ---- GSM8K ---------------------------------------------------------------
 def run_gsm8k_eval(generator, tokenizer, past_key_values, draft_past_key_values, args, dataset, log_dir):

@@ -12,12 +12,15 @@ from ..utils.flashinfer.cache_manager import (
 from ..utils.flashinfer.attention_wrapper import FlashinferAttentionWrapper
 from ..utils.flashinfer.prefill import flashinfer_chunked_prefill
 
+
 class ClassicSDGeneratorBase(ClassicSDBase):
-    def init_cuda_graph_runner(self,device,kvCachePool=None):
+    def init_cuda_graph_runner(self, device, kvCachePool=None):
         """
         Initialize the draft model CUDA-graph runner (FlashInfer path only).
         """
-        if hasattr(self.draft_model, 'init_cuda_graph_runner') and callable(self.draft_model.init_cuda_graph_runner):
+        if hasattr(self.draft_model, "init_cuda_graph_runner") and callable(
+            self.draft_model.init_cuda_graph_runner
+        ):
             self.draft_model.init_cuda_graph_runner(device=device)
 
     def _tree_decoding(self, tree, request_kv_cache, position_offset, cache_position, device):
@@ -30,33 +33,33 @@ class ClassicSDGeneratorBase(ClassicSDBase):
             non_blocking=True,
             invert=False,
         )
-               
+
         # Target model forward
         with nvtx.annotate("target_forward", color="red"):
             num_tokens = int(tree_input_ids.shape[0])
             if num_tokens == 0:
                 return None
             kvCachePool = kv_cache_pool
-            
+
             request_kv_cache.increment(num_tokens)
 
             batch_position = getKvCacheBatchPosition(
                 request_kv_caches=[request_kv_cache],
-                mode='tree',  # Set to False if you're doing incremental decoding
+                mode="tree",  # Set to False if you're doing incremental decoding
                 device=device,
                 treeTokens=num_tokens,
             )
-            # batch_position.print_info() 
+            # batch_position.print_info()
             self.flashinferWrapper.prepareAttention(
-                'tree',
+                "tree",
                 batch_position,
                 kvCachePool.page_len,
-                "NONE", # POS_ENCODING_MODE.NONE,
+                "NONE",  # POS_ENCODING_MODE.NONE,
                 kvCachePool.cache_data[0].dtype,
                 attention_mask=tree_mask,
             )
             # Check if the current instance has the attribute 'graph'
-            if hasattr(self, 'graph'):
+            if hasattr(self, "graph"):
                 outputs = self.tree_decoding_step(
                     input_ids=tree_input_ids.unsqueeze(0),
                     position_ids=tree_position_ids.unsqueeze(0),
@@ -71,10 +74,11 @@ class ClassicSDGeneratorBase(ClassicSDBase):
                     use_cache=False,
                     kvCachePool=kvCachePool,
                     batch_position=batch_position,
-                    mode='tree', 
-                    flashinferWrapper = self.flashinferWrapper,
+                    mode="tree",
+                    flashinferWrapper=self.flashinferWrapper,
                 )
         return outputs
+
     def _speculate(self, input_ids, request_kv_cache):
         return self.draft_model.speculate(
             input_ids,
@@ -122,7 +126,7 @@ class ClassicSDGeneratorBase(ClassicSDBase):
                 raise ValueError(
                     "max_length is not set. Only 'dynamic' kv-cache is supported when max_length is unspecified."
                 )
-            
+
         if model_kwargs.get("past_key_values") is not None:
             past_key_values = model_kwargs["past_key_values"]
             max_cache_len = getattr(past_key_values, "max_cache_len", None)
@@ -134,26 +138,35 @@ class ClassicSDGeneratorBase(ClassicSDBase):
             raise ValueError("past_key_values and draft_past_key_values should both be provided")
 
         stream_callback = model_kwargs.get("stream_callback", None)
-        
+
         with nvtx.annotate("prefill_chunked", color="orange"):
             self._init_tree_mask(
                 self.draft_params.max_verify_tokens, max_cache_len, device=input_ids.device
             )
-            if not hasattr(self, 'flashinferWrapper'):
+            if not hasattr(self, "flashinferWrapper"):
                 self.flashinferWrapper = FlashinferAttentionWrapper(
-                    self.target_model.config.num_attention_heads, self.target_model.config.num_key_value_heads, self.target_model.config.hidden_size,past_key_values.page_len
+                    self.target_model.config.num_attention_heads,
+                    self.target_model.config.num_key_value_heads,
+                    self.target_model.config.hidden_size,
+                    past_key_values.page_len,
                 )
 
             self.kvCachePool = past_key_values
-            request_kv_cache = RequestKvCache(
-                kvCachePool=self.kvCachePool,
-                page_len=self.kvCachePool.page_len,
-                seq_init_len=0
+            request_kv_cache = self._ensure_request_kv_cache(
+                attr_name="_fi_request_kv_cache",
+                request_cls=RequestKvCache,
+                kv_cache_pool=self.kvCachePool,
+                input_ids_len=int(input_ids.shape[1]),
+                input_ids=input_ids,
+                tokens_attr_name="_fi_request_tokens",
             )
-            draft_request_kv_cache = RequestKvCache(
-                kvCachePool=draft_past_key_values,
-                page_len=draft_past_key_values.page_len,
-                seq_init_len=0
+            draft_request_kv_cache = self._ensure_request_kv_cache(
+                attr_name="_fi_draft_request_kv_cache",
+                request_cls=RequestKvCache,
+                kv_cache_pool=draft_past_key_values,
+                input_ids_len=int(input_ids.shape[1]),
+                input_ids=input_ids,
+                tokens_attr_name="_fi_draft_request_tokens",
             )
             outputs = flashinfer_chunked_prefill(
                 target_model=self.target_model,
@@ -165,11 +178,17 @@ class ClassicSDGeneratorBase(ClassicSDBase):
             )
             next_token_logits = outputs.logits
             del outputs
-                
+
         remaining = self._remaining_token_budget(input_ids, stopping_criteria)
         if remaining is not None and int(remaining) <= 0:
-            request_kv_cache.release()
-            draft_request_kv_cache.release()
+            self._remember_request_cache_tokens(
+                tokens_attr_name="_fi_request_tokens",
+                input_ids=input_ids,
+            )
+            self._remember_request_cache_tokens(
+                tokens_attr_name="_fi_draft_request_tokens",
+                input_ids=input_ids,
+            )
             return input_ids
 
         with nvtx.annotate("sample"):
@@ -185,14 +204,26 @@ class ClassicSDGeneratorBase(ClassicSDBase):
                 remaining = self._remaining_token_budget(input_ids, stopping_criteria)
                 if remaining is not None and int(remaining) <= 0:
                     break
+                draft_headroom = self._request_cache_headroom(draft_request_kv_cache)
+                if draft_headroom is not None and int(draft_headroom) <= 0:
+                    break
 
                 with nvtx.annotate("speculate", color="cyan"):
-                    last_token_ids = input_ids[:, draft_request_kv_cache.get_seq_length():].clone(memory_format=torch.contiguous_format)
+                    last_token_ids = input_ids[
+                        :, draft_request_kv_cache.get_seq_length() :
+                    ].clone(memory_format=torch.contiguous_format)
                     tree = self._speculate(last_token_ids, draft_request_kv_cache)
+                    tree_size_before_cap = int(tree.size())
                     decoded_tree_size = self._cap_tree_to_budget(
                         tree,
                         input_ids,
                         stopping_criteria,
+                    )
+                    tree_size_after_cap = int(tree.size())
+                    self._sync_request_cache_after_tree_truncation(
+                        draft_request_kv_cache,
+                        tree_size_before=tree_size_before_cap,
+                        tree_size_after=tree_size_after_cap,
                     )
                     if decoded_tree_size <= 0:
                         break
@@ -202,7 +233,7 @@ class ClassicSDGeneratorBase(ClassicSDBase):
                     outputs = self._tree_decoding(
                         tree,
                         request_kv_cache,
-                        position_offset=input_ids.shape[1]-1,
+                        position_offset=input_ids.shape[1] - 1,
                         cache_position=None,
                         device=input_ids.device,
                     )
@@ -220,15 +251,23 @@ class ClassicSDGeneratorBase(ClassicSDBase):
                     )
                     sampled_tokens = sampled_tokens.to(input_ids.device)
                     del next_token_logits
-                    
+
                 with nvtx.annotate("kv_reorder"):
                     num_new_tokens = int(decoded_tree_size)
-                    request_kv_cache.reorder_cache_with_offset(hidden_indices, offset=prev_kv_len, num_new_tokens=num_new_tokens)
-                    draft_request_kv_cache.reorder_cache_with_offset(hidden_indices, offset=draft_request_kv_cache.get_seq_length(), num_new_tokens=num_new_tokens)
+                    request_kv_cache.reorder_cache_with_offset(
+                        hidden_indices,
+                        offset=prev_kv_len,
+                        num_new_tokens=num_new_tokens,
+                    )
+                    draft_request_kv_cache.reorder_cache_with_offset(
+                        hidden_indices,
+                        offset=draft_request_kv_cache.get_seq_length(),
+                        num_new_tokens=num_new_tokens,
+                    )
 
                 with nvtx.annotate("state_update"):
                     input_ids = torch.cat([input_ids, sampled_tokens], dim=-1)
-                
+
                 with nvtx.annotate("stop_check"):
                     finished, input_ids, kept, prune_tokens = self._apply_tokenwise_stopping_criteria(
                         input_ids=input_ids,
@@ -240,9 +279,16 @@ class ClassicSDGeneratorBase(ClassicSDBase):
                 if finished and int(prune_tokens) > 0:
                     request_kv_cache.decrement(int(prune_tokens))
                     draft_request_kv_cache.decrement(int(prune_tokens))
-        request_kv_cache.release()   
-        draft_request_kv_cache.release()  
+        self._remember_request_cache_tokens(
+            tokens_attr_name="_fi_request_tokens",
+            input_ids=input_ids,
+        )
+        self._remember_request_cache_tokens(
+            tokens_attr_name="_fi_draft_request_tokens",
+            input_ids=input_ids,
+        )
         return input_ids
-    
+
+
 class ClassicSDGenerator(SDProfilingMixin, ClassicSDGeneratorBase):
     pass

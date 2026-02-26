@@ -9,6 +9,10 @@ import logging
 from specdecodes.models.utils.wandb_logger import wandb_logger
 from run.pipelines.utils.eval_utils import reset_kv, maybe_init_cuda_graph_runner
 
+
+MTBENCH_MAX_GEN_TOKS = 1024
+
+
 def run_common_eval(generator, tokenizer, past_key_values, draft_past_key_values, args, dataset, log_dir):
     # Warm up the model
     is_profiling = generator.profiling
@@ -64,7 +68,11 @@ def run_common_eval(generator, tokenizer, past_key_values, draft_past_key_values
 
         reset_kv(past_key_values, draft_past_key_values)
 
-        output_message = tokenizer.decode(output_ids[0][input_ids.shape[1]:])
+        output_message = tokenizer.decode(
+            output_ids[0][input_ids.shape[1]:],
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
+        )
         exp_log = {**wandb_logger.log_data, "query": query, "response": output_message, "peak_memory": torch.cuda.max_memory_reserved(args.device)/(1024**3)}
         with open(log_file, 'a+') as f:
             json.dump(exp_log, f, indent=4)
@@ -123,11 +131,23 @@ def run_mtbench_eval(generator, tokenizer, past_key_values, draft_past_key_value
         messages = [{"role": "user", "content": input_message}]
         tokenizer.use_default_system_prompt = True
         input_ids = tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True, return_tensors="pt").cuda(device=args.device)
-        
+
+        remaining = int(args.max_length) - int(input_ids.shape[1])
+        if remaining <= 0:
+            continue
+        max_new_tokens = min(MTBENCH_MAX_GEN_TOKS, remaining)
+
         with sdpa_kernel(backends=[SDPBackend.CUDNN_ATTENTION]):
             gc.collect()
             torch.cuda.empty_cache()
-            generator.generate(input_ids, temperature=args.temperature, max_length=args.max_length, do_sample=args.do_sample, past_key_values=past_key_values, draft_past_key_values=draft_past_key_values)
+            generator.generate(
+                input_ids,
+                temperature=args.temperature,
+                max_new_tokens=max_new_tokens,
+                do_sample=args.do_sample,
+                past_key_values=past_key_values,
+                draft_past_key_values=draft_past_key_values,
+            )
 
         reset_kv(past_key_values, draft_past_key_values)
     generator.profiling = is_profiling
@@ -162,15 +182,28 @@ def run_mtbench_eval(generator, tokenizer, past_key_values, draft_past_key_value
             messages.append({"role": "user", "content": query})
             tokenizer.use_default_system_prompt = True
             input_ids = tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True, return_tensors="pt").cuda(device=args.device)
-                    
-            if input_ids.shape[1] > args.max_length:
+
+            remaining = int(args.max_length) - int(input_ids.shape[1])
+            if remaining <= 0:
                 logging.info(f"Skipping query No.{idx} (turn {tid}) due to length {input_ids.shape[1]} > {args.max_length}")
                 continue
-            
+            max_new_tokens = min(MTBENCH_MAX_GEN_TOKS, remaining)
+
             with sdpa_kernel(backends=[SDPBackend.CUDNN_ATTENTION]):
-                output_ids = generator.generate(input_ids, temperature=args.temperature, max_length=args.max_length, do_sample=args.do_sample, past_key_values=past_key_values, draft_past_key_values=draft_past_key_values)
+                output_ids = generator.generate(
+                    input_ids,
+                    temperature=args.temperature,
+                    max_new_tokens=max_new_tokens,
+                    do_sample=args.do_sample,
+                    past_key_values=past_key_values,
+                    draft_past_key_values=draft_past_key_values,
+                )
             
-            output_message = tokenizer.decode(output_ids[0][input_ids.shape[1]:])
+            output_message = tokenizer.decode(
+                output_ids[0][input_ids.shape[1]:],
+                skip_special_tokens=True,
+                clean_up_tokenization_spaces=False,
+            )
 
             n_iter = wandb_logger.log_data.get('n_iter', 0)
             n_tokens = wandb_logger.log_data.get('n_tokens', 0)
@@ -195,7 +228,7 @@ def run_mtbench_eval(generator, tokenizer, past_key_values, draft_past_key_value
                 tmp_exp_log['speculate_count'] += wandb_logger.log_data.get('speculate_count', 0)
 
             exp_log = {**exp_log, tid: {**wandb_logger.log_data, "query": query, "response": output_message, "peak_memory": torch.cuda.max_memory_reserved(args.device)/(1024**3)}}
-            messages.append({"role": "system", "content": output_message})
+            messages.append({"role": "assistant", "content": output_message})
             
             del input_ids, output_ids
             gc.collect()

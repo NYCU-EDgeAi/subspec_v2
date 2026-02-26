@@ -2,8 +2,6 @@ import math
 import torch
 from typing import Tuple, Optional
 
-from .wandb_logger import wandb_logger
-
 
 @torch.no_grad()
 def lossy_bottom_up_verify(
@@ -60,9 +58,6 @@ def lossy_bottom_up_verify(
         )
     use_entropy = threshold_method_str == "entropy"
 
-    def _gate_blocks(value: float) -> bool:
-        return value >= threshold_f if use_entropy else value < threshold_f
-
     def _compute_entropy_list(prob_rows: torch.Tensor) -> list[float]:
         vocab_size = int(prob_rows.shape[1])
         denom = math.log(vocab_size) if vocab_size > 1 else 1.0
@@ -91,14 +86,6 @@ def lossy_bottom_up_verify(
                 if exact_after[c] > max_exact_after:
                     max_exact_after = exact_after[c]
         return has_exact, max_exact_after
-
-    mismatch_context: list[bool] = [False] * num_nodes
-    for u in range(num_nodes):
-        children = children_lists[u]
-        if not children:
-            continue
-        tgt = target_tokens_i[u]
-        mismatch_context[u] = all(token_ids_i[int(c)] != tgt for c in children)
 
     entropy_i: Optional[list[float]] = None
     if use_entropy:
@@ -167,97 +154,13 @@ def lossy_bottom_up_verify(
             best_next[u] = best_c
             best_len[u] = best_total_len
 
-    # Precompute window-eligible gate values per node.
-    window_ok_gate_val: list[Optional[float]] = [None] * num_nodes
-    if use_entropy:
-        for u in range(num_nodes):
-            if not children_lists[u] or not mismatch_context[u]:
-                continue
-            for c in children_lists[u]:
-                c = int(c)
-                if exact_after_len[c] >= required_exact_after:
-                    window_ok_gate_val[u] = float(entropy_i[u]) if entropy_i is not None else 0.0
-                    break
-    else:
-        for u in range(num_nodes):
-            if not mismatch_context[u]:
-                continue
-            max_p: Optional[float] = None
-            for c in children_lists[u]:
-                c = int(c)
-                if exact_after_len[c] < required_exact_after:
-                    continue
-                tok = token_ids_i[c]
-                p = float(probs[u, tok].item())
-                if max_p is None or p > max_p:
-                    max_p = p
-            window_ok_gate_val[u] = max_p
-
     # Top-down extraction for the chosen path.
     sampled_tokens: list[int] = []
     hidden_indices: list[int] = []
     context = root_index
     accept_len = 0
 
-    # Path-only diagnostics:
-    # - mismatch: visited contexts where target token isn't among children.
-    # - threshold-drop mismatch: window is satisfied but gate blocks acceptance.
-    path_mismatch_steps = 0
-    path_mismatch_eligible_steps = 0
-    path_mismatch_threshold_drop_steps = 0
-
-    mismatch_accepted_steps = 0
-
-    mismatch_accepted_no_match_steps = 0
-
-    def _welford_update(stat_key: str, x: float) -> None:
-        """Update a running mean/std in wandb_logger.internal_data.
-
-        We keep internal accumulators out of JSONL by not storing them in
-        wandb_logger.log_data.
-        """
-        state = wandb_logger.internal_data.get(stat_key)
-        if state is None:
-            state = {"n": 0, "mean": 0.0, "M2": 0.0}
-
-        n0 = int(state["n"])
-        mean0 = float(state["mean"])
-        M2_0 = float(state["M2"])
-
-        n1 = n0 + 1
-        delta = x - mean0
-        mean1 = mean0 + delta / n1
-        delta2 = x - mean1
-        M2_1 = M2_0 + delta * delta2
-
-        wandb_logger.internal_data[stat_key] = {"n": n1, "mean": mean1, "M2": M2_1}
-
-    def _welford_mean_std(stat_key: str) -> tuple[float, float]:
-        state = wandb_logger.internal_data.get(stat_key)
-        if not state:
-            return 0.0, 0.0
-        n = int(state.get("n", 0))
-        mean = float(state.get("mean", 0.0))
-        M2 = float(state.get("M2", 0.0))
-        if n <= 0:
-            return 0.0, 0.0
-        var = M2 / n
-        return mean, float(max(var, 0.0) ** 0.5)
-
     while True:
-        # Count mismatch stats for each visited context (including the final bonus context).
-        if mismatch_context[context]:
-            path_mismatch_steps += 1
-            gate_val = window_ok_gate_val[context]
-            if gate_val is not None:
-                path_mismatch_eligible_steps += 1
-                _welford_update("lossy/window_ok_gate", gate_val)
-
-                # If blocked, lowering the threshold to the gate value would allow a lossy accept.
-                if _gate_blocks(gate_val):
-                    path_mismatch_threshold_drop_steps += 1
-                    _welford_update("lossy/window_ok_drop_gate", gate_val)
-
         nxt = best_next[context]
         if nxt < 0:
             break
@@ -266,19 +169,6 @@ def lossy_bottom_up_verify(
         sampled_tokens.append(tok)
         hidden_indices.append(context)
         accept_len += 1
-
-        # If target token doesn't match, this is a lossy-accepted mismatch.
-        if tok != target_tokens_i[context]:
-            mismatch_accepted_steps += 1
-            p = float(probs[context, tok].item())
-            _welford_update("verify/mm_acc_p", float(p))
-
-            gate_val = float(entropy_i[context]) if use_entropy and entropy_i is not None else p
-            _welford_update("lossy/accept_gate", gate_val)
-
-            # Count lossy accepts when the target token was not among children.
-            if mismatch_context[context]:
-                mismatch_accepted_no_match_steps += 1
 
         if eos_token_id is not None and tok == int(eos_token_id):
             break
@@ -289,52 +179,6 @@ def lossy_bottom_up_verify(
     if not sampled_tokens or (eos_token_id is None) or (sampled_tokens[-1] != int(eos_token_id)):
         sampled_tokens.append(target_tokens_i[context])
         hidden_indices.append(context)
-
-    # Persist diagnostics into the per-generation log (accumulated across calls).
-    def _int_acc(key: str, value: float) -> None:
-        wandb_logger.internal_data[key] = float(wandb_logger.internal_data.get(key, 0.0)) + float(value)
-
-    # Keep raw counts internal (not written to JSONL).
-    _int_acc("lossy/accept_tokens", float(accept_len))
-    _int_acc("lossy/mm_ctx", float(path_mismatch_steps))
-    _int_acc("lossy/mm_elig_ctx", float(path_mismatch_eligible_steps))
-    _int_acc("lossy/mm_drop_ctx", float(path_mismatch_threshold_drop_steps))
-    _int_acc("lossy/mm_acc_steps", float(mismatch_accepted_steps))
-    _int_acc("lossy/mm_acc_nomatch_steps", float(mismatch_accepted_no_match_steps))
-
-    # Export concise metrics.
-    accept_tokens = float(wandb_logger.internal_data.get("lossy/accept_tokens", 0.0))
-    mm_ctx = float(wandb_logger.internal_data.get("lossy/mm_ctx", 0.0))
-    mm_elig_ctx = float(wandb_logger.internal_data.get("lossy/mm_elig_ctx", 0.0))
-    mm_drop_ctx = float(wandb_logger.internal_data.get("lossy/mm_drop_ctx", 0.0))
-    mm_acc_steps = float(wandb_logger.internal_data.get("lossy/mm_acc_steps", 0.0))
-    mm_acc_nomatch_steps = float(wandb_logger.internal_data.get("lossy/mm_acc_nomatch_steps", 0.0))
-
-    wandb_logger.log_data["verify_accept_tokens"] = accept_tokens
-    wandb_logger.log_data["verify_lossy_accept_tokens"] = mm_acc_steps
-    wandb_logger.log_data["verify_lossy_accept_rate"] = (mm_acc_steps / accept_tokens) if accept_tokens > 0 else 0.0
-
-    # "If I lower threshold, what would I unlock?" (only when window is satisfiable)
-    wandb_logger.log_data["lossy_window_ok_drop_rate"] = (mm_drop_ctx / mm_elig_ctx) if mm_elig_ctx > 0 else 0.0
-    wandb_logger.log_data["lossy_accept_rate_when_no_match"] = (mm_acc_nomatch_steps / mm_ctx) if mm_ctx > 0 else 0.0
-
-    gate_mean, gate_std = _welford_mean_std("lossy/window_ok_gate")
-    wandb_logger.log_data["lossy_window_ok_gate_mean"] = gate_mean
-    wandb_logger.log_data["lossy_window_ok_gate_std"] = gate_std
-
-    drop_gate_mean, drop_gate_std = _welford_mean_std("lossy/window_ok_drop_gate")
-    wandb_logger.log_data["lossy_window_ok_drop_gate_mean"] = drop_gate_mean
-    wandb_logger.log_data["lossy_window_ok_drop_gate_std"] = drop_gate_std
-
-    wandb_logger.log_data["lossy_threshold_method"] = "entropy" if use_entropy else "prob"
-
-    acc_p_mean, acc_p_std = _welford_mean_std("verify/mm_acc_p")
-    wandb_logger.log_data["lossy_accepted_prob_mean"] = acc_p_mean
-    wandb_logger.log_data["lossy_accepted_prob_std"] = acc_p_std
-
-    acc_gate_mean, acc_gate_std = _welford_mean_std("lossy/accept_gate")
-    wandb_logger.log_data["lossy_accepted_gate_mean"] = acc_gate_mean
-    wandb_logger.log_data["lossy_accepted_gate_std"] = acc_gate_std
 
     return (
         torch.tensor(sampled_tokens, dtype=torch.long),

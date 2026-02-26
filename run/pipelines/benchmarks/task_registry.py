@@ -35,6 +35,7 @@ _TASK_SPECS: Dict[str, TaskSpec] = {
         {LANE_DISTRIBUTION: evals.run_multichoice_ll_eval},
     ),
     # Behavior lane (generation-based, SD-aware).
+    "mt-bench": TaskSpec("mt-bench", {LANE_BEHAVIOR: evals.run_mtbench_eval}),
     "gsm8k": TaskSpec("gsm8k", {LANE_BEHAVIOR: evals.run_gsm8k_eval}),
     "human-eval": TaskSpec("human-eval", {LANE_BEHAVIOR: evals.run_humaneval_eval}),
     "human-eval-instruct": TaskSpec("human-eval-instruct", {LANE_BEHAVIOR: evals.run_humaneval_eval}),

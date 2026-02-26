@@ -6,6 +6,7 @@ import nvtx
 from .base import GeneratorBase
 from ..utils.mixin import SDProfilingMixin
 
+
 class ClassicSDGeneratorBase(GeneratorBase):
     def __init__(self, generator_kwargs, *model_args, **kwargs):
         super().__init__(*model_args, **kwargs)
@@ -27,8 +28,8 @@ class ClassicSDGeneratorBase(GeneratorBase):
     
     def _verify(self, draft_ids, root_ind, logits, logits_processor, do_sample, skip_nodes: int = 0):
         global_ids = self._sample_token(logits, logits_processor, do_sample, return_probs=False)  # [1, T]
-        g0 = global_ids[0] # [T]
-        d = draft_ids[0][root_ind:root_ind + g0.size(0)] # [T]
+        g0 = global_ids[0]  # [T]
+        d = draft_ids[0][root_ind : root_ind + g0.size(0)]  # [T]
 
         valid = (d[1:] == g0[:-1]) & (g0[:-1] != self.draft_model.eos_token_id)
         accept_len = int(torch.cumprod(valid.to(torch.int64), dim=0).sum().item())
@@ -83,7 +84,6 @@ class ClassicSDGeneratorBase(GeneratorBase):
             
         if model_kwargs.get("past_key_values") is not None:
             past_key_values = model_kwargs["past_key_values"]
-            max_cache_len = getattr(past_key_values.cache, "max_cache_len", None)
 
             if model_kwargs.get("draft_past_key_values") is not None:
                 draft_past_key_values = model_kwargs["draft_past_key_values"]
@@ -129,7 +129,7 @@ class ClassicSDGeneratorBase(GeneratorBase):
                         input_ids,
                         stopping_criteria,
                     )
-                    if self.cache_implementation == 'dynamic':
+                    if self.cache_implementation == "dynamic":
                         _, input_len = input_ids.shape
                         draft_past_key_values.crop(input_len)
 
@@ -148,18 +148,20 @@ class ClassicSDGeneratorBase(GeneratorBase):
 
                 with nvtx.annotate("verify"):
                     root_ind = 0
-                    sampled_tokens, hidden_indices, (total_len, accept_len) = self._verify(
-                                                        draft_ids, root_ind, next_token_logits, 
-                                                        logits_processor,
-                                                        do_sample
-                                                    )
+                    sampled_tokens, _, _ = self._verify(
+                        draft_ids,
+                        root_ind,
+                        next_token_logits,
+                        logits_processor,
+                        do_sample,
+                    )
                     del next_token_logits
-                    
+
                 with nvtx.annotate("state_update"):
                     input_ids = torch.cat([input_ids, sampled_tokens], dim=-1)
-                
+
                 with nvtx.annotate("stop_check"):
-                    finished, input_ids, kept, prune_tokens = self._apply_tokenwise_stopping_criteria(
+                    finished, input_ids, kept, _ = self._apply_tokenwise_stopping_criteria(
                         input_ids=input_ids,
                         sampled_tokens=sampled_tokens,
                         stopping_criteria=stopping_criteria,
@@ -168,11 +170,12 @@ class ClassicSDGeneratorBase(GeneratorBase):
                     self._maybe_stream(stream_callback, kept)
                                 
                 with nvtx.annotate("kv_update"):
-                    if self.cache_implementation == 'dynamic':
+                    if self.cache_implementation == "dynamic":
                         past_key_values.crop(prev_kv_len + sampled_tokens.shape[1])
                     past_key_values.seq_len += sampled_tokens.shape[1]
-                    
+
         return input_ids
-    
+
+
 class ClassicSDGenerator(SDProfilingMixin, ClassicSDGeneratorBase):
     pass

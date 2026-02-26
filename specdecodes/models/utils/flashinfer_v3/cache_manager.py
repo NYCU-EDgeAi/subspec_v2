@@ -66,12 +66,15 @@ class KvCachePool:
         self.page_len = page_len
         self.max_cache_len = max_cache_len if max_cache_len is not None else max_pages * page_len
         self.free_page_mask = torch.ones(max_pages, dtype=torch.bool, device="cpu")
+        self.reset_counter = 0
         self.num_heads = num_heads
         self.head_dims = head_dim
         self.dtype = dtype
 
     def reset(self):
         self.cache_data.zero_()
+        self.free_page_mask.fill_(True)
+        self.reset_counter += 1
 
     def num_free_pages(self):
         return self.free_page_mask.sum()

@@ -96,9 +96,15 @@ class Tree:
             new_nodes = []
             new_leaves = []
             old_size = self.current_size
+            leaf_count = len(self.available_leaves)
+            if leaf_count == 0:
+                break
 
             # Create new nodes
             for i, (p_idx, t_id, pr) in enumerate(zip(p_inds, t_ids, probs)):
+                # After tree pruning, speculative parent indices can reference the
+                # previous frontier width. Rebase them to current leaves.
+                p_idx = int(p_idx) % int(leaf_count)
                 parent_idx = self.available_leaves[p_idx]
                 parent_node = self.nodes[parent_idx]
                 node = TreeNode(

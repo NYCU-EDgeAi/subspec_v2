@@ -5,7 +5,6 @@ import nvtx
 
 from .classic_sd import ClassicSDGeneratorBase
 from ..utils.mixin import SDProfilingMixin
-from ..utils.utils import invert_mask
 
 
 class EagleSDGeneratorBase(ClassicSDGeneratorBase):
@@ -32,10 +31,10 @@ class EagleSDGeneratorBase(ClassicSDGeneratorBase):
                 attention_mask=tree_mask,
                 position_ids=tree_position_ids.unsqueeze(0),
                 output_hidden_states=True,
-                cache_position=cache_position
+                cache_position=cache_position,
             )
         return outputs
-    
+
     def _verify_step(self, p, token_ids, logits_processor, do_sample):
         sampled_token_id = p.argmax() if not do_sample else p.multinomial(1).squeeze(-1)
         if torch.any(sampled_token_id == token_ids):
@@ -83,18 +82,21 @@ class EagleSDGeneratorBase(ClassicSDGeneratorBase):
                 raise ValueError(
                     "max_length is not set. Only 'dynamic' kv-cache is supported when max_length is unspecified."
                 )
-            
-        if model_kwargs.get("past_key_values") is not None and model_kwargs.get("draft_past_key_values") is not None:
+
+        if (
+            model_kwargs.get("past_key_values") is not None
+            and model_kwargs.get("draft_past_key_values") is not None
+        ):
             past_key_values = model_kwargs["past_key_values"]
             max_cache_len = getattr(past_key_values.cache, "max_cache_len", None)
-            
+
             draft_past_key_values = model_kwargs["draft_past_key_values"]
             self.draft_model.set_past_key_values(draft_past_key_values)
         else:
             raise ValueError("past_key_values and draft_past_key_values should both be provided")
 
         stream_callback = model_kwargs.get("stream_callback", None)
-        
+
         with nvtx.annotate("prefill_chunked", color="orange"):
             self._init_tree_mask(
                 self.draft_params.max_verify_tokens, max_cache_len, device=input_ids.device
@@ -137,9 +139,9 @@ class EagleSDGeneratorBase(ClassicSDGeneratorBase):
                     )
                     if decoded_tree_size <= 0:
                         break
-                    if self.cache_implementation == 'dynamic':
+                    if self.cache_implementation == "dynamic":
                         _, input_len = input_ids.shape
-                        draft_past_key_values.crop(input_len-1)
+                        draft_past_key_values.crop(input_len - 1)
 
                 with nvtx.annotate("target_decode", color="orange"):
                     prev_kv_len = past_key_values.get_seq_length()
@@ -170,15 +172,15 @@ class EagleSDGeneratorBase(ClassicSDGeneratorBase):
                         logits_processor,
                         do_sample,
                     )
-                    
+
                     sampled_tokens = sampled_tokens.to(input_ids.device)
                     hidden_indices = hidden_indices.to(hidden_states.device)
                     del next_token_logits
-                    
+
                 with nvtx.annotate("state_update"):
                     input_ids = torch.cat([input_ids, sampled_tokens], dim=-1)
                     hidden_states = hidden_states[:, hidden_indices].clone()
-                
+
                 with nvtx.annotate("stop_check"):
                     finished, input_ids, kept, prune_tokens = self._apply_tokenwise_stopping_criteria(
                         input_ids=input_ids,
@@ -198,11 +200,11 @@ class EagleSDGeneratorBase(ClassicSDGeneratorBase):
                     past_key_values.seq_len += hidden_indices.shape[0]
                     if finished:
                         past_key_values.seq_len -= prune_tokens
-                    
+
             self.draft_model.final_update(input_ids, hidden_states)
-                
+
         return input_ids
 
-    
+
 class EagleSDGenerator(SDProfilingMixin, EagleSDGeneratorBase):
     pass

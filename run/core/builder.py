@@ -1,23 +1,25 @@
 import logging
 import os
 import random
-from typing import Optional, TYPE_CHECKING
 from types import SimpleNamespace
+from typing import TYPE_CHECKING, Optional
 
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM
-from specdecodes.models.utils.cache_utils import create_kv_cache
 from specdecodes.models.generators.naive import NaiveGenerator
-from .router import run_app
-from .registry import ModelRegistry
+from specdecodes.models.utils.cache_utils import create_kv_cache
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
 from .config_utils import instantiate_recipe
-# Type hint only, import inside init to avoid circular dependency from .registry import ModelRegistry
+from .registry import ModelRegistry
+from .router import run_app
+
 if TYPE_CHECKING:
     from .configuration import AppConfig
 
 
 LOGLEVEL = os.environ.get("LOGLEVEL", "INFO").upper()
 logging.basicConfig(level=LOGLEVEL)
+
 
 class GeneratorPipelineBuilder:
     """
@@ -33,8 +35,9 @@ class GeneratorPipelineBuilder:
     def __init__(self, config: Optional["AppConfig"] = None):
         if config is None:
             from .configuration import AppConfig
+
             config = AppConfig()
-        
+
         self.config = config
 
         self.config_path = getattr(config, "config_path", None)
@@ -46,13 +49,16 @@ class GeneratorPipelineBuilder:
         # (Some entrypoints may construct AppConfig directly without going through run/main.py.)
         self.recipe = instantiate_recipe(getattr(self, "recipe", None))
         self.config.recipe = self.recipe
-        
+
     @property
     def args(self) -> SimpleNamespace:
-        my_dict = {k: v for k, v in self.__dict__.items() if not k.startswith("_") and not callable(v)}
+        my_dict = {
+            k: v
+            for k, v in self.__dict__.items()
+            if not k.startswith("_") and not callable(v)
+        }
         return SimpleNamespace(**my_dict)
-        
-    
+
     def configure_torch(self):
         """
         Set up torch configurations for reproducibility and performance.
@@ -93,7 +99,7 @@ class GeneratorPipelineBuilder:
 
         tokenizer = AutoTokenizer.from_pretrained(model_path)
         # Use CPU if an offloader is provided via recipe; otherwise use the desired device.
-        device_map = 'cpu' if (self.recipe and self.recipe.offloader) else self.device
+        device_map = "cpu" if (self.recipe and self.recipe.offloader) else self.device
         model = AutoModelForCausalLM.from_pretrained(
             model_path,
             torch_dtype=self.dtype,
@@ -111,7 +117,7 @@ class GeneratorPipelineBuilder:
         entry = ModelRegistry.get(self.config.method)
         if entry and entry.load_draft_model_fn:
             return entry.load_draft_model_fn(self, target_model, tokenizer, draft_model_path)
-            
+
         draft_model_cls = entry.get_draft_model_cls() if entry else None
         if draft_model_cls:
             # Assuming standard from_pretrained pattern
@@ -120,12 +126,12 @@ class GeneratorPipelineBuilder:
                 target_model=target_model,
                 torch_dtype=self.dtype,
                 eos_token_id=tokenizer.eos_token_id,
-                device_map=self.device
+                device_map=self.device,
             )
             return draft_model
         return None
-    
-    def load_kv_cache(self, target_model, draft_model):    
+
+    def load_kv_cache(self, target_model, draft_model):
         entry = ModelRegistry.get(self.config.method)
         # If there is no draft model, we never allocate a draft KV cache.
         if draft_model is None:
@@ -149,14 +155,14 @@ class GeneratorPipelineBuilder:
         if entry and entry.load_kv_cache_fn:
             past_key_values, draft_past_key_values = entry.load_kv_cache_fn(self, target_model, draft_model)
             return past_key_values, draft_past_key_values if needs_draft_kv_cache else None
-                    
+
         if self.cache_implementation == "static":
             if self.max_length is not None:
                 # `max_length` is the hard upper bound for generation and KV cache.
                 max_cache_len = int(self.max_length)
             else:
                 raise ValueError("max_length should be set for static cache.")
-            
+
             # Create static kv-cache
             past_key_values = create_kv_cache(
                 "static",
@@ -166,7 +172,6 @@ class GeneratorPipelineBuilder:
                 device=self.device,
                 dtype=target_model.model.dtype,
             )
-            # if generator.draft_model is not None:
             if needs_draft_kv_cache:
                 draft_past_key_values = create_kv_cache(
                     "static",
@@ -185,9 +190,9 @@ class GeneratorPipelineBuilder:
                 draft_past_key_values = create_kv_cache("dynamic")
             else:
                 draft_past_key_values = None
-        
+
         return past_key_values, draft_past_key_values
-    
+
     def load_generator(self, target_model, tokenizer, draft_model=None):
         """
         Initialize the generator with the target model, tokenizer, and draft model.
@@ -206,7 +211,7 @@ class GeneratorPipelineBuilder:
                 generator_kwargs=self.generator_kwargs,
             )
             return generator
-            
+
         # Fallback to NaiveGenerator if not in registry (or default behavior)
         generator = NaiveGenerator(
             target_model=target_model,
@@ -253,13 +258,18 @@ class GeneratorPipelineBuilder:
         method_name = str(getattr(self.config, "method", ""))
         is_flashinfer_method = "_fi" in method_name
         fullgraph = not is_flashinfer_method
-        
-        # If the target model uses offloading, torch.compile() (especially fullgraph/cudagraph-related paths)
-        # is typically incompatible or provides little benefit. Skip compiling target_model in that case.
+
+        # Skip target compile when offloading is active or the method opts out.
+        entry = ModelRegistry.get(self.config.method)
+        method_allows_target_compile = bool(getattr(entry, "compile_target", True)) if entry else True
         has_offloader = bool(getattr(self.recipe, "offloader", None))
-        is_no_offload_method = method_name.endswith("_no_offload") or method_name.endswith("_no_offloader")
-        if has_offloader or is_no_offload_method:
-            logging.info("Skipping torch.compile() for target_model because recipe.offloader is set.")
+        if has_offloader or not method_allows_target_compile:
+            reason = (
+                "recipe.offloader is set"
+                if has_offloader
+                else f"method '{method_name}' opts out"
+            )
+            logging.info(f"Skipping torch.compile() for target_model because {reason}.")
         else:
             generator.target_model.forward = torch.compile(
                 generator.target_model.forward,
@@ -269,7 +279,7 @@ class GeneratorPipelineBuilder:
             )
         
         # Compile draft model if it exists
-        if getattr(generator, 'draft_model', None) is not None:
+        if getattr(generator, "draft_model", None) is not None:
             try:
                 draft_param_device = next(generator.draft_model.model.parameters()).device
             except StopIteration:
@@ -285,7 +295,7 @@ class GeneratorPipelineBuilder:
                 dynamic=False,
                 fullgraph=fullgraph,
             )
-    
+
     def post_process(self, generator, tokenizer, past_kv, draft_past_kv):
         pass
     
@@ -306,7 +316,7 @@ class GeneratorPipelineBuilder:
                 dtype=self.dtype,
                 device=self.device,
             )
-            
+
             # Apply quantization first
             if draft_model and draft_config and draft_config.get("quant_config"):
                 self.recipe.apply_quantization(draft_model.model, draft_config["quant_config"], self.dtype, self.device)
@@ -320,7 +330,7 @@ class GeneratorPipelineBuilder:
                 self.recipe.apply_offloading(model, target_config["device_map"], draft_model=draft_model)
 
         return model, draft_model, tokenizer
-    
+
     def build_generator_pipeline(self, model, draft_model, tokenizer):
         """
         Build the generator pipeline using pre-built model, draft_model, and tokenizer.

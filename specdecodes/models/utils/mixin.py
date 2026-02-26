@@ -12,6 +12,9 @@ _PROFILE_LOG_DEFAULTS = {
     "avg_target_time": 0.0,
     "avg_verify_time": 0.0,
     "avg_sampled": 0.0,
+    "verify_nonterminal_rounds": 0,
+    "mean_verify_accept_len_nonterminal": 0.0,
+    "std_verify_accept_len_nonterminal": 0.0,
     "n_iter": 0,
     "n_tokens": 0,
     "elapsed_time": 0.0,
@@ -86,7 +89,12 @@ class SDProfilingMixin:
         self.profiling_verbose = profiling_verbose
         self.profile_draft_time = getattr(self, "profile_draft_time", True)
         
-        self.profile_data = {}
+        self.profile_data = {
+            "iter": [],
+            "total_len": [],
+            "accept_len": [],
+            "verify_eos": [],
+        }
         self.sampled_count = 1 # assume first token is sampled (prefill stage)
         self.iter_count = 1 # assume first step is done (prefill stage)
         
@@ -161,11 +169,20 @@ class SDProfilingMixin:
         self.profile_data['iter'] = self.profile_data.get('iter', [])
         self.profile_data['total_len'] = self.profile_data.get('total_len', [])
         self.profile_data['accept_len'] = self.profile_data.get('accept_len', [])
+        self.profile_data['verify_eos'] = self.profile_data.get('verify_eos', [])
             
-        sampled_tokens_list = sampled_tokens.squeeze(0).tolist()
+        sampled_tokens_1d = sampled_tokens.squeeze(0)
+        sampled_tokens_list = sampled_tokens_1d.tolist()
+        eos_token_id = getattr(self.tokenizer, "eos_token_id", None)
+        round_hit_eos = (
+            eos_token_id is not None
+            and sampled_tokens_1d.numel() > 0
+            and int(sampled_tokens_1d[-1].item()) == int(eos_token_id)
+        )
         self.profile_data['iter'].append(sampled_tokens_list)
         self.profile_data['total_len'].append(total_len)
         self.profile_data['accept_len'].append(accept_len)
+        self.profile_data['verify_eos'].append(bool(round_hit_eos))
         # logging
         logging.debug(
             f"Total: {tree.size()},"\
@@ -267,31 +284,67 @@ class SDProfilingMixin:
         total_sampled = self.sampled_count
         total_iterations = self.iter_count
         avg_sampled = total_sampled / total_iterations
-        depth = max(self.profile_data['total_len']) + 1
-        
-        # alpha (node)
-        total_lens = torch.bincount( torch.tensor(self.profile_data['total_len']), minlength=depth)
-        accept_lens = torch.bincount( torch.tensor(self.profile_data['accept_len']), minlength=depth)
-        depth_total_cnt = total_lens + total_lens.sum() - total_lens.cumsum(dim=-1) # reverse cumsum
-        depth_total_cnt = depth_total_cnt[1:] # remove first element
-        depth_accept_cnt = accept_lens + accept_lens.sum() - accept_lens.cumsum(dim=-1) # reverse cumsum
-        depth_accept_cnt = depth_accept_cnt[1:] # remove first element
-        alpha_per_node = depth_accept_cnt.float() / depth_total_cnt.float()
-        
-        # aLive ratio
-        depth_alive_rate = depth_total_cnt.float() / depth_total_cnt[0]
-        
-        # alpha (depth)
-        sampled_lens = torch.tensor([len(sampled_tokens) for sampled_tokens in self.profile_data["iter"]])
-        sampled_len_bins = torch.bincount(sampled_lens, minlength=depth+1)
-        depth_total_cnt = sampled_len_bins + sampled_len_bins.sum() - sampled_len_bins.cumsum(dim=-1) # reverse cumsum
-        depth_accept_cnt = depth_total_cnt - sampled_len_bins
-        depth_total_cnt = depth_total_cnt[1:depth]
-        depth_accept_cnt = depth_accept_cnt[1:depth]
-        alpha_per_depth = depth_accept_cnt.float() / depth_total_cnt.float()
+        accept_len_list = [int(x) for x in self.profile_data.get("accept_len", [])]
+        verify_eos_list = [bool(x) for x in self.profile_data.get("verify_eos", [])]
+        if len(verify_eos_list) < len(accept_len_list):
+            verify_eos_list.extend([False] * (len(accept_len_list) - len(verify_eos_list)))
+        nonterminal_accept_len_list = [
+            accept_len
+            for accept_len, hit_eos in zip(accept_len_list, verify_eos_list)
+            if not hit_eos
+        ]
+        verify_nonterminal_rounds = int(len(nonterminal_accept_len_list))
+        verify_nonterminal_accept_tokens = float(sum(nonterminal_accept_len_list))
+        mean_verify_accept_len_nonterminal = (
+            float(verify_nonterminal_accept_tokens / verify_nonterminal_rounds)
+            if verify_nonterminal_rounds > 0
+            else 0.0
+        )
+        std_verify_accept_len_nonterminal = 0.0
+        if verify_nonterminal_rounds > 0:
+            second_moment = float(
+                sum(float(x) * float(x) for x in nonterminal_accept_len_list)
+            ) / float(verify_nonterminal_rounds)
+            variance = max(0.0, second_moment - mean_verify_accept_len_nonterminal ** 2)
+            std_verify_accept_len_nonterminal = float(variance ** 0.5)
+        total_len_list = [int(x) for x in self.profile_data.get("total_len", [])]
+        has_verify_rounds = len(total_len_list) > 0
+        if has_verify_rounds:
+            depth = max(total_len_list) + 1
+
+            # alpha (node)
+            total_lens = torch.bincount(torch.tensor(total_len_list), minlength=depth)
+            accept_lens = torch.bincount(
+                torch.tensor([int(x) for x in self.profile_data["accept_len"]]),
+                minlength=depth,
+            )
+            depth_total_cnt = total_lens + total_lens.sum() - total_lens.cumsum(dim=-1)
+            depth_total_cnt = depth_total_cnt[1:]
+            depth_accept_cnt = accept_lens + accept_lens.sum() - accept_lens.cumsum(dim=-1)
+            depth_accept_cnt = depth_accept_cnt[1:]
+            alpha_per_node = depth_accept_cnt.float() / depth_total_cnt.float()
+
+            # alive ratio
+            depth_alive_rate = depth_total_cnt.float() / depth_total_cnt[0]
+
+            # alpha (depth)
+            sampled_lens = torch.tensor([len(sampled_tokens) for sampled_tokens in self.profile_data["iter"]])
+            sampled_len_bins = torch.bincount(sampled_lens, minlength=depth + 1)
+            depth_total_cnt = sampled_len_bins + sampled_len_bins.sum() - sampled_len_bins.cumsum(dim=-1)
+            depth_accept_cnt = depth_total_cnt - sampled_len_bins
+            depth_total_cnt = depth_total_cnt[1:depth]
+            depth_accept_cnt = depth_accept_cnt[1:depth]
+            alpha_per_depth = depth_accept_cnt.float() / depth_total_cnt.float()
+        else:
+            depth = 1
+            depth_total_cnt = torch.empty(0, dtype=torch.long)
+            depth_accept_cnt = torch.empty(0, dtype=torch.long)
+            alpha_per_node = torch.empty(0, dtype=torch.float32)
+            alpha_per_depth = torch.empty(0, dtype=torch.float32)
+            depth_alive_rate = torch.empty(0, dtype=torch.float32)
         
         # log stats
-        if self.profiling_verbose:
+        if self.profiling_verbose and has_verify_rounds:
             tb = pt.PrettyTable()
             tb.field_names = [ "Summary \\ Depth" ] + [ f"{i}" for i in range(1, depth) ]
             tb.add_row([ "Trials count" ] + [ f"{val}" for val in depth_total_cnt.tolist() ])
@@ -318,12 +371,16 @@ class SDProfilingMixin:
         avg_draft_s, avg_target_s, avg_verify_s = self.compute_average_times()
         n_tokens = len(input_ids[0][org_input_len:])
         tput = (n_tokens / elapsed_time_s) if elapsed_time_s > 0 else 0.0
+
         _commit_profile_log(
             {
                 "avg_draft_time": avg_draft_s,
                 "avg_target_time": avg_target_s,
                 "avg_verify_time": avg_verify_s,
                 "avg_sampled": avg_sampled,
+                "verify_nonterminal_rounds": verify_nonterminal_rounds,
+                "mean_verify_accept_len_nonterminal": mean_verify_accept_len_nonterminal,
+                "std_verify_accept_len_nonterminal": std_verify_accept_len_nonterminal,
                 "n_iter": total_iterations,
                 "n_tokens": n_tokens,
                 "elapsed_time": elapsed_time_s,

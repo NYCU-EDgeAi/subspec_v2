@@ -23,7 +23,14 @@ def flashinfer_chunked_prefill(
     Returns the last forward outputs.
     """
 
-    prefill_length = input_ids.size(1)
+    current_kv_len = int(request_kv_cache.get_seq_length())
+    prefill_tokens = input_ids[:, current_kv_len:]
+    prefill_length = prefill_tokens.size(1)
+    if prefill_length <= 0:
+        raise ValueError(
+            f"FlashInfer prefill expects prompt growth (input_len={int(input_ids.size(1))}, "
+            f"cached_len={current_kv_len})."
+        )
     chunk_size = (
         prefill_length
         if prefill_chunk_size is None
@@ -32,7 +39,7 @@ def flashinfer_chunked_prefill(
 
     outputs = None
     for start in range(0, prefill_length, chunk_size):
-        chunk = input_ids[:, start : start + chunk_size]
+        chunk = prefill_tokens[:, start : start + chunk_size]
         num_new_tokens = chunk.size(1)
 
         request_kv_cache.increment(num_new_tokens)

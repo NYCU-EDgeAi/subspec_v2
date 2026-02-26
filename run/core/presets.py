@@ -470,7 +470,6 @@ def register_presets():
         pass
     
     # KV Rewrite
-    print("Registering KV Rewrite method...")
     try:
         from specdecodes.models.generators.kv_rewrite import KVRewriteGenerator
         from specdecodes.models.draft_models.kv_rewrite import SubSpecSDDraftModel as KVRewriteDraftModel
@@ -487,6 +486,7 @@ def register_presets():
                 "recipe": KVRewriteRecipe(),
             },
             needs_draft_kv_cache=False,
+            compile_target=False,
         )
     except ImportError:
         pass

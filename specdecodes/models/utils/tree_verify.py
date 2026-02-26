@@ -70,10 +70,40 @@ def verify_tree(
 
         node_data = tree.get_tree_data(skip_nodes=skip_nodes)
         token_ids = node_data["token_ids"]
+        base = int(skip_nodes)
+        visible_rows = int(min(global_p.shape[0], token_ids.shape[0]))
+
+        if visible_rows <= 0:
+            # No visible tree rows from logits; emit one token from the first row.
+            dist0 = global_p[0].squeeze(0)
+            bonus0 = dist0.multinomial(num_samples=1).squeeze(-1) if do_sample else dist0.argmax()
+            return bonus0.view(1, 1), torch.tensor([int(root_ind)], dtype=torch.long), (1, 0)
+
+        empty_long = torch.empty(0, dtype=torch.long, device="cpu")
+
+        def _is_visible(idx: torch.Tensor) -> bool:
+            if idx.numel() == 0:
+                return False
+            local = idx - base
+            return bool(torch.all((local >= 0) & (local < visible_rows)))
+
+        def _filter_visible_children(children: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            if children.numel() == 0:
+                return empty_long, empty_long
+            local = children - base
+            valid = (local >= 0) & (local < visible_rows)
+            if not torch.any(valid):
+                return empty_long, empty_long
+            children = children[valid]
+            return children, token_ids[(children - base).long()]
 
         cur_ind = torch.tensor([int(root_ind)], dtype=torch.long, device="cpu")
-        children_inds = tree.get_children_indices(cur_ind)
-        children_token_ids = token_ids[children_inds - int(skip_nodes)]
+        if not _is_visible(cur_ind):
+            cur_ind = torch.tensor([base], dtype=torch.long, device="cpu")
+        last_valid_cur_ind = cur_ind.clone()
+        children_inds, children_token_ids = _filter_visible_children(
+            tree.get_children_indices(cur_ind)
+        )
 
         bonus_token = None
 
@@ -83,37 +113,41 @@ def verify_tree(
 
         while children_inds.numel() > 0:
             total_len += 1
-            dist = global_p[cur_ind - int(skip_nodes)].squeeze(0)
+            if not _is_visible(cur_ind):
+                break
+            dist = global_p[(cur_ind - base).long()].squeeze(0)
             accept_token_id, bonus_token = verify_step_fn(dist, children_token_ids, logits_processor, do_sample)
 
             if accept_token_id is not None:
                 accept_len += 1
                 sampled_tokens = torch.cat([sampled_tokens, accept_token_id[None]])
                 hidden_indices = torch.cat([hidden_indices, cur_ind])
+                last_valid_cur_ind = cur_ind.clone()
 
                 if eos_token_id is not None and int(accept_token_id) == int(eos_token_id):
                     break
 
-                cur_ind = children_inds[children_token_ids == accept_token_id]
-                children_inds = tree.get_children_indices(cur_ind)
-                children_token_ids = token_ids[children_inds - int(skip_nodes)]
+                matched_children = children_inds[children_token_ids == accept_token_id]
+                if matched_children.numel() == 0:
+                    break
+                cur_ind = matched_children[:1]
 
-                if (children_inds - int(skip_nodes)).numel() == 0:
-                    break
-                if int(torch.min(children_inds - int(skip_nodes)).item()) >= int(global_p.shape[0]):
-                    break
+                children_inds, children_token_ids = _filter_visible_children(
+                    tree.get_children_indices(cur_ind)
+                )
             else:
                 break
 
         # Bonus token, unless EOS already emitted.
         if sampled_tokens.numel() == 0 or (eos_token_id is None) or (int(sampled_tokens[-1].item()) != int(eos_token_id)):
+            bonus_ref_ind = cur_ind if _is_visible(cur_ind) else last_valid_cur_ind
             if bonus_token is None:
-                dist = global_p[cur_ind - int(skip_nodes)].squeeze(0)
+                dist = global_p[(bonus_ref_ind - base).long()].squeeze(0)
                 bonus_token = dist.multinomial(num_samples=1).squeeze(-1) if do_sample else dist.argmax()
 
             if bonus_token is not None:
                 sampled_tokens = torch.cat([sampled_tokens, bonus_token.unsqueeze(0)])
-                hidden_indices = torch.cat([hidden_indices, cur_ind])
+                hidden_indices = torch.cat([hidden_indices, bonus_ref_ind])
 
         return sampled_tokens.unsqueeze(0), hidden_indices, (int(total_len), int(accept_len))
 

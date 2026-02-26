@@ -127,6 +127,8 @@ class ClassicSDDraftModel(DraftModelBase):
         
     @torch.no_grad()
     def update_tree(self, tree_data):
+        if not tree_data.has_data():
+            return self.tree
         with nvtx.annotate("tree_finalize"):
             with nvtx.annotate("tree_data/get"):
                 data = tree_data.get_data()

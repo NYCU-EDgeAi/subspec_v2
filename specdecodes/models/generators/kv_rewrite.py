@@ -6,6 +6,7 @@ import nvtx
 from .classic_seq_sd import ClassicSDGeneratorBase
 from ..utils.mixin import SDProfilingMixin
 
+
 class KVRewriteGeneratorBase(ClassicSDGeneratorBase):
     def _verify(self, draft_ids, root_ind, logits, logits_processor, do_sample, skip_nodes: int = 0):
         # KV rewrite accepts the entire drafted block.
@@ -13,7 +14,7 @@ class KVRewriteGeneratorBase(ClassicSDGeneratorBase):
         total_len = accept_len + 1
         sampled_tokens = draft_ids[:, :total_len]
         return sampled_tokens, None, (total_len, accept_len)
-    
+
     def _generate(
         self,
         input_ids: torch.LongTensor,
@@ -92,7 +93,6 @@ class KVRewriteGeneratorBase(ClassicSDGeneratorBase):
         if done:
             return input_ids
 
-        
         with nvtx.annotate("speculate", color="cyan"):
             last_token_id = sampled_tokens[:, -1:].clone(memory_format=torch.contiguous_format)
             draft_ids = self._speculate(last_token_id)
@@ -119,21 +119,21 @@ class KVRewriteGeneratorBase(ClassicSDGeneratorBase):
                         dtype=torch.long,
                         device=input_ids.device,
                     )
-                    _ = self._tree_decoding(draft_ids, cache_position, past_key_values)
-                    
+                    self._tree_decoding(draft_ids, cache_position, past_key_values)
+
                 with nvtx.annotate("verify"):
-                    _ = self._verify(draft_ids, None, None, None, None)
-                    
+                    self._verify(draft_ids, None, None, None, None)
+
                 sampled_tokens = draft_ids[:, 1:]
                 self.draft_model.init_postspec()
                 self.draft_model.sim_run_postspec()
                 draft_ids = self.draft_model.get_draft_ids_after_post()
-                    
+
                 with nvtx.annotate("state_update"):
                     input_ids = torch.cat([input_ids, sampled_tokens], dim=-1)
-                
+
                 with nvtx.annotate("stop_check"):
-                    finished, input_ids, kept, prune_tokens = self._apply_tokenwise_stopping_criteria(
+                    finished, input_ids, kept, _ = self._apply_tokenwise_stopping_criteria(
                         input_ids=input_ids,
                         sampled_tokens=sampled_tokens,
                         stopping_criteria=stopping_criteria,
@@ -144,8 +144,9 @@ class KVRewriteGeneratorBase(ClassicSDGeneratorBase):
                 with nvtx.annotate("kv_update"):
                     # Keep committed cache length exactly aligned with generated prefix.
                     past_key_values.seq_len = input_ids.shape[1]
-                
+
         return input_ids
-    
+
+
 class KVRewriteGenerator(SDProfilingMixin, KVRewriteGeneratorBase):
     pass

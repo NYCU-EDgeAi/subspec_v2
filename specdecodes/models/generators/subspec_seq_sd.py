@@ -6,6 +6,7 @@ import nvtx
 from .classic_seq_sd import ClassicSDGeneratorBase
 from ..utils.mixin import SDProfilingMixin
 
+
 class SubSpecSDGeneratorBase(ClassicSDGeneratorBase):
     def _generate(
         self,
@@ -51,8 +52,7 @@ class SubSpecSDGeneratorBase(ClassicSDGeneratorBase):
             
         if model_kwargs.get("past_key_values") is not None:
             past_key_values = model_kwargs["past_key_values"]
-            max_cache_len = getattr(past_key_values.cache, "max_cache_len", None)
-            
+
             self.draft_model.set_past_key_values(past_key_values)
         else:
             raise ValueError("past_key_values is not provided")
@@ -98,7 +98,7 @@ class SubSpecSDGeneratorBase(ClassicSDGeneratorBase):
 
                 with nvtx.annotate("target_decode", color="orange"):
                     prev_kv_len = past_key_values.get_seq_length()
-                    if self.cache_implementation == 'dynamic':
+                    if self.cache_implementation == "dynamic":
                         past_key_values.crop(prev_kv_len)
                     position_offset = int(input_ids.shape[1]) - 1
                     cache_position = torch.arange(
@@ -113,17 +113,19 @@ class SubSpecSDGeneratorBase(ClassicSDGeneratorBase):
 
                 with nvtx.annotate("verify"):
                     root_ind = 0
-                    sampled_tokens, hidden_indices, (total_len, accept_len) = self._verify(
-                                                            draft_ids, root_ind, next_token_logits, 
-                                                            logits_processor,
-                                                            do_sample
-                                                        )
+                    sampled_tokens, _, _ = self._verify(
+                        draft_ids,
+                        root_ind,
+                        next_token_logits,
+                        logits_processor,
+                        do_sample,
+                    )
                     sampled_tokens = sampled_tokens.to(input_ids.device)
                     del next_token_logits
-                    
+
                 with nvtx.annotate("state_update"):
                     input_ids = torch.cat([input_ids, sampled_tokens], dim=-1)
-                
+
                 with nvtx.annotate("stop_check"):
                     finished, input_ids, kept, prune_tokens = self._apply_tokenwise_stopping_criteria(
                         input_ids=input_ids,
@@ -134,13 +136,14 @@ class SubSpecSDGeneratorBase(ClassicSDGeneratorBase):
                     self._maybe_stream(stream_callback, kept)
                                 
                 with nvtx.annotate("kv_update"):
-                    if self.cache_implementation == 'dynamic':
+                    if self.cache_implementation == "dynamic":
                         past_key_values.crop(prev_kv_len + sampled_tokens.shape[1])
                     past_key_values.seq_len += sampled_tokens.shape[1]
                     if finished:
                         past_key_values.seq_len -= prune_tokens
-                
+
         return input_ids
-    
+
+
 class SubSpecSDGenerator(SDProfilingMixin, SubSpecSDGeneratorBase):
     pass

@@ -9,6 +9,7 @@ from ..utils.mixin import SDProfilingMixin
 from ..utils.utils import invert_mask
 from ..utils.tree_verify import verify_tree
 
+
 class ClassicSDGeneratorBase(GeneratorBase):
     def __init__(self, generator_kwargs, *model_args, **kwargs):
         super().__init__(*model_args, **kwargs)
@@ -18,10 +19,13 @@ class ClassicSDGeneratorBase(GeneratorBase):
     def _speculate(self, input_ids):
         return self.draft_model.speculate(input_ids)
         
-    def _init_tree_mask(self, max_verify_tokens, max_cache_len=None, device='cpu'):
-        if not hasattr(self, 'tree_mask_update_method'):
-            self.tree_mask_update_method = 'static' if max_cache_len is not None else 'dynamic'
-            logging.debug(f"'max_cache_len' is {'set, uses static' if max_cache_len else 'not set, uses dynamic'} tree_mask.")
+    def _init_tree_mask(self, max_verify_tokens, max_cache_len=None, device="cpu"):
+        if not hasattr(self, "tree_mask_update_method"):
+            self.tree_mask_update_method = "static" if max_cache_len is not None else "dynamic"
+            logging.debug(
+                "'max_cache_len' is %s tree_mask.",
+                "set, uses static" if max_cache_len else "not set, uses dynamic",
+            )
 
         tree_mask = (
             torch.zeros((1, 1, max_verify_tokens, max_cache_len), device=device, dtype=torch.bool)
@@ -31,7 +35,7 @@ class ClassicSDGeneratorBase(GeneratorBase):
         return tree_mask
 
     def _get_tree_mask(self, tree_mask_partial):
-        if self.tree_mask_update_method == 'static':
+        if self.tree_mask_update_method == "static":
             # Avoid prints in hot path; use logging if needed.
             _, _, K, D = tree_mask_partial.shape
 
@@ -104,18 +108,18 @@ class ClassicSDGeneratorBase(GeneratorBase):
                 past_key_values=past_key_values.cache,
                 attention_mask=tree_mask,
                 position_ids=tree_position_ids.unsqueeze(0),
-                cache_position=cache_position
+                cache_position=cache_position,
             )
         return outputs
- 
+
     def _verify_step(self, p, token_ids, logits_processor, do_sample):
         sampled_token_id = p.argmax() if not do_sample else p.multinomial(1).squeeze(-1)
         if torch.any(sampled_token_id == token_ids):
             return sampled_token_id, None
         else:
             return None, sampled_token_id
-        
-    def _verify(self, tree, root_ind ,logits, logits_processor, do_sample,skip_nodes=0):
+
+    def _verify(self, tree, root_ind, logits, logits_processor, do_sample, skip_nodes=0):
         verify_method = str(self.generator_kwargs.get("verify_method", "exact") or "exact").strip().lower()
         verify_kwargs = dict(self.generator_kwargs.get("verify_kwargs") or {})
 
@@ -132,7 +136,6 @@ class ClassicSDGeneratorBase(GeneratorBase):
             verify_method=verify_method,
             verify_kwargs=verify_kwargs,
         )
-
 
     def _generate(
         self,
@@ -228,7 +231,7 @@ class ClassicSDGeneratorBase(GeneratorBase):
                     )
                     if decoded_tree_size <= 0:
                         break
-                    if self.cache_implementation == 'dynamic':
+                    if self.cache_implementation == "dynamic":
                         _, input_len = input_ids.shape
                         draft_past_key_values.crop(input_len)
 
@@ -263,10 +266,10 @@ class ClassicSDGeneratorBase(GeneratorBase):
                     
                     sampled_tokens = sampled_tokens.to(input_ids.device)
                     del next_token_logits
-                    
+
                 with nvtx.annotate("state_update"):
                     input_ids = torch.cat([input_ids, sampled_tokens], dim=-1)
-                
+
                 with nvtx.annotate("stop_check"):
                     finished, input_ids, kept, prune_tokens = self._apply_tokenwise_stopping_criteria(
                         input_ids=input_ids,
@@ -286,8 +289,9 @@ class ClassicSDGeneratorBase(GeneratorBase):
                     past_key_values.seq_len += hidden_indices.shape[0]
                     if finished:
                         past_key_values.seq_len -= prune_tokens
-                    
+
         return input_ids
-    
+
+
 class ClassicSDGenerator(SDProfilingMixin, ClassicSDGeneratorBase):
     pass

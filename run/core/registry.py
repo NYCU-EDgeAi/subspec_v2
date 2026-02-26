@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-import importlib
-from typing import Any, Dict, Optional, Callable
 from dataclasses import dataclass, field
+import importlib
+from typing import Any, Callable, Dict, Optional
 
 
 def _resolve_symbol(spec: Any, *, method_name: str, role: str) -> Any:
@@ -46,6 +46,8 @@ class ModelRegistryEntry:
     # Whether the method needs a separate draft KV cache when a draft model is present.
     # Many methods (e.g., SubSpec) can share the target KV cache.
     needs_draft_kv_cache: bool = True
+    # Whether to compile target model forward for this method.
+    compile_target: bool = True
 
     _resolved_generator_cls: Any = field(default=None, init=False, repr=False, compare=False)
     _resolved_draft_model_cls: Any = field(default=None, init=False, repr=False, compare=False)
@@ -68,6 +70,7 @@ class ModelRegistryEntry:
             )
         return self._resolved_draft_model_cls
 
+
 class ModelRegistry:
     _registry: Dict[str, ModelRegistryEntry] = {}
 
@@ -77,12 +80,13 @@ class ModelRegistry:
         name: str,
         generator_cls: Any,
         draft_model_cls: Any,
-        default_config: Dict[str, Any] = None,
+        default_config: Optional[Dict[str, Any]] = None,
         load_model_fn: Optional[Callable] = None,
         load_draft_model_fn: Optional[Callable] = None,
         load_kv_cache_fn: Optional[Callable] = None,
         needs_draft_kv_cache: bool = True,
-    ):
+        compile_target: bool = True,
+    ) -> None:
         if default_config is None:
             default_config = {}
         cls._registry[name] = ModelRegistryEntry(
@@ -94,6 +98,7 @@ class ModelRegistry:
             load_draft_model_fn=load_draft_model_fn,
             load_kv_cache_fn=load_kv_cache_fn,
             needs_draft_kv_cache=bool(needs_draft_kv_cache),
+            compile_target=bool(compile_target),
         )
 
     @classmethod
@@ -101,5 +106,5 @@ class ModelRegistry:
         return cls._registry.get(name)
 
     @classmethod
-    def list_methods(cls):
+    def list_methods(cls) -> list[str]:
         return sorted(cls._registry.keys())
