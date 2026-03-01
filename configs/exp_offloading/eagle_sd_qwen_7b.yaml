@@ -2,7 +2,7 @@ method: eagle_sd
 vram_limit_gb: 8
 seed: 0
 device: cuda:0
-max_length: 2048
+max_length: 4096
 
 llm_path: Qwen/Qwen2.5-7B-Instruct
 draft_model_path: ~/checkpoints/eagle/official/EAGLE-Qwen2.5-7B-Instruct

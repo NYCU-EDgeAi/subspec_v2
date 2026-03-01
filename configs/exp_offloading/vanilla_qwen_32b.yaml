@@ -1,7 +1,7 @@
 method: vanilla
 vram_limit_gb: 24
 device: cuda:0
-max_length: 2048
+max_length: 4096
 
 llm_path: Qwen/Qwen2.5-32B-Instruct
 

@@ -2,7 +2,7 @@ method: subspec_sd
 vram_limit_gb: 8
 seed: 0
 device: cuda:0
-max_length: 2048
+max_length: 4096
 
 llm_path: meta-llama/Llama-3.1-8B-Instruct
 
@@ -16,7 +16,7 @@ generator_kwargs:
 
 draft_params:
   temperature: 0.2
-  max_depth: 48
+  max_depth: 32
   topk_len: 6
 
 recipe:

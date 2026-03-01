@@ -1,5 +1,5 @@
-# SubSpec SD (v2 FI) method config
-method: subspec_sd_v2_fi
+# SubSpec SD (v1) deterministic trace
+method: subspec_sd
 
 llm_path: meta-llama/Llama-3.1-8B-Instruct
 
@@ -9,12 +9,8 @@ recipe:
 max_length: 4096
 cache_implementation: static
 warmup_iter: 1
-# Required for flashinfer to work correctly
 compile_mode: null
 
-
-
-# Target sampling settings (defaults)
 do_sample: false
 temperature: 0
 
@@ -24,7 +20,7 @@ generator_kwargs:
   prefill_chunk_size: 256
   verify_method: exact
   verify_kwargs: {}
-  disable_post_verify: true
+  step_trace: true
 
 draft_params:
   temperature: 0.2
