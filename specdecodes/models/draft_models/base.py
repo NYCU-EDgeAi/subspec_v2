@@ -1,5 +1,6 @@
 import logging
 import os
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import nvtx
@@ -145,6 +146,14 @@ class TreeMaskCache:
         else:
             return self.tree_mask_cache
 
+
+@dataclass(frozen=True)
+class FIFirstStepContract:
+    attention_mode: str
+    batch_position_mode: str
+    cache_increment: str
+    position_ids_style: str
+
 class DraftModelBase(nn.Module):
     def __init__(self, base_model=None, target_model=None, eos_token_id=None, *model_args, **model_kwargs):
         super().__init__()
@@ -269,6 +278,230 @@ class DraftModelBase(nn.Module):
                     kwargs[key] = value.to(model_device, non_blocking=True)
 
         return input_ids, kwargs
+
+    def _fi_cuda_graph_reset_state(self, *, decode_chunk_size: int) -> None:
+        self.decode_chunk_size = int(decode_chunk_size)
+        self.graph = None
+        self.output_buffer = None
+        self.first_graph = None
+        self.first_output_buffer = None
+        self._cuda_graph_inited = False
+
+    def _fi_graph_enabled(self, attr_name: str = "graph") -> bool:
+        return getattr(self, attr_name, None) is not None
+
+    def _fi_alloc_batch_position_buffers(
+        self,
+        *,
+        prefix: str,
+        batch_size: int,
+        token_count: int,
+        max_pages: int,
+        device: torch.device,
+    ):
+        # Local import avoids pulling flashinfer-specific modules unless FI path is used.
+        from ..utils.flashinfer.cache_manager import KvCacheBatchPosition
+
+        prefix = str(prefix)
+        batch_size = int(batch_size)
+        token_count = int(token_count)
+        max_pages = int(max_pages)
+
+        setattr(
+            self,
+            f"{prefix}seq_indptr_buf",
+            torch.zeros((batch_size + 1,), dtype=torch.int32, device=device),
+        )
+        setattr(
+            self,
+            f"{prefix}kv_page_indptr_buf",
+            torch.zeros((batch_size + 1,), dtype=torch.int32, device=device),
+        )
+        setattr(
+            self,
+            f"{prefix}kv_page_indices_buf",
+            torch.zeros((max_pages,), dtype=torch.int32, device=device),
+        )
+        setattr(
+            self,
+            f"{prefix}kv_last_page_len_buf",
+            torch.zeros((batch_size,), dtype=torch.int32, device=device),
+        )
+        setattr(
+            self,
+            f"{prefix}batch_indices_buf",
+            torch.zeros((token_count,), dtype=torch.int32, device=device),
+        )
+        setattr(
+            self,
+            f"{prefix}positions_buf",
+            torch.zeros((token_count,), dtype=torch.int32, device=device),
+        )
+
+        batch_position = KvCacheBatchPosition(
+            seq_indptr=getattr(self, f"{prefix}seq_indptr_buf"),
+            kv_page_indptr=getattr(self, f"{prefix}kv_page_indptr_buf"),
+            kv_page_indices=getattr(self, f"{prefix}kv_page_indices_buf"),
+            kv_last_page_len=getattr(self, f"{prefix}kv_last_page_len_buf"),
+            batch_indices=getattr(self, f"{prefix}batch_indices_buf"),
+            positions=getattr(self, f"{prefix}positions_buf"),
+        )
+        setattr(self, f"{prefix}batch_position", batch_position)
+        return batch_position
+
+    def _fi_copy_batch_position_to_buffers(
+        self,
+        *,
+        prefix: str,
+        batch_position,
+        expected_token_count: Optional[int] = None,
+        context: str = "fi_graph",
+    ) -> int:
+        prefix = str(prefix)
+        kv_page_indices_buf = getattr(self, f"{prefix}kv_page_indices_buf")
+        batch_indices_buf = getattr(self, f"{prefix}batch_indices_buf")
+
+        token_count = int(batch_position.batch_indices.numel())
+        if expected_token_count is not None and token_count != int(expected_token_count):
+            raise RuntimeError(
+                f"{context}: token_count mismatch, "
+                f"expected={int(expected_token_count)}, actual={token_count}"
+            )
+        if int(batch_position.positions.numel()) != token_count:
+            raise RuntimeError(
+                f"{context}: positions size mismatch, "
+                f"batch_indices={token_count}, positions={int(batch_position.positions.numel())}"
+            )
+        if token_count > int(batch_indices_buf.numel()):
+            raise RuntimeError(
+                f"{context}: token_count exceeds static graph buffer size, "
+                f"token_count={token_count}, buffer={int(batch_indices_buf.numel())}"
+            )
+
+        n_pages = int(batch_position.kv_page_indptr[-1].item())
+        if n_pages > int(kv_page_indices_buf.numel()):
+            raise RuntimeError(
+                f"{context}: kv_page_indices overflow, "
+                f"n_pages={n_pages}, buffer={int(kv_page_indices_buf.numel())}"
+            )
+
+        getattr(self, f"{prefix}seq_indptr_buf").copy_(batch_position.seq_indptr)
+        getattr(self, f"{prefix}kv_page_indptr_buf").copy_(batch_position.kv_page_indptr)
+        getattr(self, f"{prefix}kv_last_page_len_buf").copy_(batch_position.kv_last_page_len)
+        getattr(self, f"{prefix}batch_indices_buf")[:token_count].copy_(batch_position.batch_indices)
+        getattr(self, f"{prefix}positions_buf")[:token_count].copy_(batch_position.positions)
+        getattr(self, f"{prefix}kv_page_indices_buf")[:n_pages].copy_(batch_position.kv_page_indices[:n_pages])
+        return n_pages
+
+    def _fi_replay_graph_step(
+        self,
+        *,
+        prefix: str,
+        graph_attr: str,
+        output_attr: str,
+        token_ids: torch.Tensor,
+        position_ids: torch.Tensor,
+        batch_position,
+        max_tokens: int,
+        require_exact_tokens: bool,
+        context: str,
+    ):
+        if token_ids.ndim != 2:
+            raise RuntimeError(f"{context}: token_ids must be rank-2, got shape={tuple(token_ids.shape)}")
+        if position_ids.ndim != 2:
+            raise RuntimeError(
+                f"{context}: position_ids must be rank-2, got shape={tuple(position_ids.shape)}"
+            )
+
+        batch_size, token_count = token_ids.shape
+        if int(batch_size) != 1:
+            raise RuntimeError(f"{context}: only batch_size=1 is supported, got {int(batch_size)}")
+
+        token_count = int(token_count)
+        max_tokens = int(max_tokens)
+        if require_exact_tokens:
+            if token_count != max_tokens:
+                raise RuntimeError(
+                    f"{context}: expected exactly {max_tokens} tokens, got {token_count}"
+                )
+        elif token_count > max_tokens:
+            raise RuntimeError(
+                f"{context}: token count exceeds graph capacity, "
+                f"token_count={token_count}, max_tokens={max_tokens}"
+            )
+
+        getattr(self, f"{prefix}input_ids_buf")[:, :token_count].copy_(token_ids)
+        getattr(self, f"{prefix}position_ids_buf")[:, :token_count].copy_(position_ids)
+        self._fi_copy_batch_position_to_buffers(
+            prefix=prefix,
+            batch_position=batch_position,
+            expected_token_count=token_count,
+            context=context,
+        )
+
+        graph = getattr(self, graph_attr, None)
+        if graph is None:
+            raise RuntimeError(f"{context}: graph '{graph_attr}' is not initialized")
+        graph.replay()
+        return getattr(self, output_attr)
+
+    def _fi_prepare_first_step(
+        self,
+        *,
+        request_kv_cache,
+        kv_len: int,
+        input_len: int,
+        batch_size: int,
+        device: torch.device,
+        contract: FIFirstStepContract,
+        get_batch_position_fn=None,
+    ):
+        input_len = int(input_len)
+        kv_len = int(kv_len)
+        batch_size = int(batch_size)
+
+        if contract.cache_increment == "one":
+            if input_len != 1:
+                raise RuntimeError(
+                    "first-step decode contract requires single-token input, "
+                    f"got input_len={input_len}"
+                )
+            increment_tokens = 1
+        elif contract.cache_increment == "input_len":
+            increment_tokens = input_len
+        else:
+            raise ValueError(f"Unsupported cache_increment: {contract.cache_increment}")
+
+        request_kv_cache.increment(increment_tokens)
+        tree_tokens = input_len if contract.batch_position_mode == "tree" else None
+        if get_batch_position_fn is None:
+            from ..utils.flashinfer.cache_manager import getKvCacheBatchPosition
+            get_batch_position_fn = getKvCacheBatchPosition
+        batch_position = get_batch_position_fn(
+            [request_kv_cache],
+            mode=contract.batch_position_mode,
+            device=device,
+            treeTokens=tree_tokens,
+        )
+
+        if contract.position_ids_style == "constant_kv_len":
+            position_ids = torch.full(
+                (batch_size, input_len),
+                kv_len,
+                device=device,
+                dtype=torch.long,
+            )
+        elif contract.position_ids_style == "arange":
+            position_ids = torch.arange(
+                kv_len,
+                kv_len + input_len,
+                dtype=torch.long,
+                device=device,
+            ).unsqueeze(0)
+        else:
+            raise ValueError(f"Unsupported position_ids_style: {contract.position_ids_style}")
+
+        return batch_position, position_ids
     
     @torch.no_grad()
     def speculate(self, input_ids, past_key_values, **kwargs):

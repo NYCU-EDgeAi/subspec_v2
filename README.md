@@ -161,6 +161,10 @@ The following methods are available (registered in `run/core/presets.py`):
 
 ## Evaluation
 
+Investigation notes:
+
+- `docs/subspec_sd_v2_fi_acceptance_root_cause.md`: root-cause, follow-up benchmark snapshot, and next-session plan for `subspec_sd_v2_fi`.
+
 ```bash
 # Quick sanity check
 python -m run.main --config configs/methods/<method_name>.yaml run-test

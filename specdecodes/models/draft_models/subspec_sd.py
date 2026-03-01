@@ -44,6 +44,19 @@ class SubSpecSDDraftModel(ClassicSDDraftModel):
         # Convert the model to the desired dtype and return
         model.to(dtype=torch_dtype)
         return model
+
+    def _resolve_prob_dtype(self) -> torch.dtype:
+        lm_head = getattr(self.model, "lm_head", None)
+        if lm_head is not None and hasattr(lm_head, "weight"):
+            return lm_head.weight.dtype
+        try:
+            return next(self.model.parameters()).dtype
+        except StopIteration:
+            return torch.float16
+
+    def _maybe_log_draft_prob(self, sampled_probs: torch.Tensor) -> None:
+        if wandb_logger.get_flag("detailed_analysis", False):
+            self.draft_prob = [torch.max(sampled_probs[:, -1:]).cpu().item()]
     
     @torch.no_grad()
     def speculate(self, input_ids, **kwargs):
@@ -51,16 +64,7 @@ class SubSpecSDDraftModel(ClassicSDDraftModel):
         
         # 1) Obtain necessary parameters
         device = input_ids.device
-        lm_head = getattr(self.model, "lm_head", None)
-        if lm_head is not None and hasattr(lm_head, "weight"):
-            dtype = lm_head.weight.dtype
-        else:
-            # Some patched Linear replacements (e.g., GemLiteLinearTriton) may not
-            # expose a `.weight` attribute. Fall back to model parameter dtype.
-            try:
-                dtype = next(self.model.parameters()).dtype
-            except StopIteration:
-                dtype = torch.float16
+        dtype = self._resolve_prob_dtype()
         batch_size, input_len = input_ids.shape
         max_cache_len = getattr(self.past_key_values.cache, "max_cache_len", None)
         assert batch_size == 1, "Only support batch_size=1 for now."
@@ -103,9 +107,7 @@ class SubSpecSDDraftModel(ClassicSDDraftModel):
             dtype=dtype,
             device=device,
         )
-        
-        if wandb_logger.get_flag("detailed_analysis", False):
-            self.draft_prob = [torch.max(sampled_probs[:, -1:]).cpu().item()]
+        self._maybe_log_draft_prob(sampled_probs)
 
         # 5) First update of tree_data and tree_mask_cache
         with nvtx.annotate("tree_update", color="green"):
@@ -118,7 +120,7 @@ class SubSpecSDDraftModel(ClassicSDDraftModel):
         self.cache_position = torch.arange(kv_len, kv_len+self.draft_params.topk_len, dtype=torch.long, device=device)
         
         # 6) Main loop
-        for depth_i in range(self.draft_params.max_depth-1):
+        for _ in range(self.draft_params.max_depth - 1):
             if not self.speculate_once():
                 break
 
@@ -136,9 +138,11 @@ class SubSpecSDDraftModel(ClassicSDDraftModel):
             return False
         if self.postspec_count > (self.draft_params.max_depth - 1):
             return False
+        cache_position = getattr(self, "cache_position", None)
+        step_tokens = int(cache_position.numel()) if isinstance(cache_position, torch.Tensor) else 0
         if not self._has_postspec_headroom(
-            step_tokens=int(getattr(self, "cache_position", torch.empty(0)).numel()),
-            cache_position=getattr(self, "cache_position", None),
+            step_tokens=step_tokens,
+            cache_position=cache_position,
         ):
             return False
         with nvtx.annotate("postspec_step", color="blue"):

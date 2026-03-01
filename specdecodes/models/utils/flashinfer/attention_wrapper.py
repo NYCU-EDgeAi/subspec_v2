@@ -39,6 +39,7 @@ class FlashinferAttentionWrapper:
         page_len: int,
         *,
         tree_use_cuda_graph: bool = True,
+        decode_use_cuda_graph: bool = False,
     ):
         self.hidden_size = hidden_size
         self.num_attention_heads = num_attention_heads
@@ -47,6 +48,7 @@ class FlashinferAttentionWrapper:
         self._head_padded_dim = find_padded_head_dim(self.head_dim)
         self.page_len = page_len
         self.tree_use_cuda_graph = bool(tree_use_cuda_graph)
+        self.decode_use_cuda_graph = bool(decode_use_cuda_graph)
 
         self.group_size = self.num_attention_heads // self.num_key_value_heads
         _workspace_buffer = torch.empty(
@@ -56,12 +58,38 @@ class FlashinferAttentionWrapper:
             float_workspace_buffer=_workspace_buffer, kv_layout="NHD",
         )
         _use_tensor_cores = self.group_size in [7, 16]
-        self.decode_wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
-            float_workspace_buffer=_workspace_buffer,
-            kv_layout="NHD",
-            use_tensor_cores=_use_tensor_cores,
-            
-        )
+        if self.decode_use_cuda_graph:
+            batch_size = 1
+            self.decode_paged_kv_indptr_buf = torch.zeros(
+                (batch_size + 1,),
+                dtype=torch.int32,
+                device=torch.cuda.current_device(),
+            )
+            self.decode_paged_kv_indices_buf = torch.zeros(
+                1024,
+                dtype=torch.int32,
+                device=torch.cuda.current_device(),
+            )
+            self.decode_paged_kv_last_page_len_buf = torch.zeros(
+                (batch_size,),
+                dtype=torch.int32,
+                device=torch.cuda.current_device(),
+            )
+            self.decode_wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+                float_workspace_buffer=_workspace_buffer,
+                kv_layout="NHD",
+                use_cuda_graph=True,
+                use_tensor_cores=_use_tensor_cores,
+                paged_kv_indptr_buffer=self.decode_paged_kv_indptr_buf,
+                paged_kv_indices_buffer=self.decode_paged_kv_indices_buf,
+                paged_kv_last_page_len_buffer=self.decode_paged_kv_last_page_len_buf,
+            )
+        else:
+            self.decode_wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+                float_workspace_buffer=_workspace_buffer,
+                kv_layout="NHD",
+                use_tensor_cores=_use_tensor_cores,
+            )
 
         if self.tree_use_cuda_graph:
             # FlashInfer tree wrapper in CUDA-graph mode has a fixed row budget
@@ -114,6 +142,16 @@ class FlashinferAttentionWrapper:
                 kv_layout="NHD",
             )
 
+    @staticmethod
+    def _plan(wrapper, *args, **kwargs) -> None:
+        plan_fn = getattr(wrapper, "plan", None)
+        if not callable(plan_fn):
+            raise AttributeError(
+                "FlashInfer wrapper does not expose plan(). "
+                "Install a newer flashinfer build that supports the plan API."
+            )
+        plan_fn(*args, **kwargs)
+
     def prepareAttention(
         self,
         mode: str,
@@ -124,34 +162,37 @@ class FlashinferAttentionWrapper:
         attention_mask: Optional[torch.Tensor] = None,
     ):
         if mode == "tree" and attention_mask is not None:
-            self.tree_wrapper.begin_forward(
-                    batch_position.seq_indptr,
-                    batch_position.kv_page_indptr,
-                    batch_position.kv_page_indices,
-                    batch_position.kv_last_page_len,
-                    self.num_attention_heads,
-                    self.num_key_value_heads,
-                    self._head_padded_dim,
-                    page_len,
-                    custom_mask = attention_mask,
-                    causal = False,
-                    non_blocking = True
+            self._plan(
+                self.tree_wrapper,
+                batch_position.seq_indptr,
+                batch_position.kv_page_indptr,
+                batch_position.kv_page_indices,
+                batch_position.kv_last_page_len,
+                self.num_attention_heads,
+                self.num_key_value_heads,
+                self._head_padded_dim,
+                page_len,
+                custom_mask=attention_mask,
+                causal=False,
+                non_blocking=True,
             )
         elif mode == "tree" and attention_mask is None:
-            self.tree_wrapper.begin_forward(
-                    batch_position.seq_indptr,
-                    batch_position.kv_page_indptr,
-                    batch_position.kv_page_indices,
-                    batch_position.kv_last_page_len,
-                    self.num_attention_heads,
-                    self.num_key_value_heads,
-                    self._head_padded_dim,
-                    page_len,
-                    non_blocking=True,
-                    causal = True,
+            self._plan(
+                self.tree_wrapper,
+                batch_position.seq_indptr,
+                batch_position.kv_page_indptr,
+                batch_position.kv_page_indices,
+                batch_position.kv_last_page_len,
+                self.num_attention_heads,
+                self.num_key_value_heads,
+                self._head_padded_dim,
+                page_len,
+                non_blocking=True,
+                causal=True,
             )
         elif mode == "prefill":
-            self.prefill_wrapper.begin_forward(
+            self._plan(
+                self.prefill_wrapper,
                 batch_position.seq_indptr,
                 batch_position.kv_page_indptr,
                 batch_position.kv_page_indices,
@@ -163,7 +204,8 @@ class FlashinferAttentionWrapper:
                 causal=True,
             )
         elif mode == "decode":
-            self.decode_wrapper.begin_forward(
+            self._plan(
+                self.decode_wrapper,
                 batch_position.kv_page_indptr,
                 batch_position.kv_page_indices,
                 batch_position.kv_last_page_len,

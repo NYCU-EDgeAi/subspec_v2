@@ -8,6 +8,26 @@ from ..utils.mixin import SDProfilingMixin
 
 
 class SubSpecSDGeneratorBase(ClassicSDGeneratorBase):
+    def _commit_target_cache_reorder(
+        self,
+        past_key_values,
+        *,
+        hidden_indices: torch.Tensor,
+        prev_kv_len: int,
+        decoded_tree_size: int,
+        finished: bool,
+        prune_tokens: int,
+    ) -> None:
+        past_key_values.reorder_cache_with_offset(
+            hidden_indices,
+            offset=int(prev_kv_len),
+            new_chunk_len=int(decoded_tree_size),
+            dim=2,
+        )
+        past_key_values.seq_len += int(hidden_indices.shape[0])
+        if finished:
+            past_key_values.seq_len -= int(prune_tokens)
+
     def _generate(
         self,
         input_ids: torch.LongTensor,
@@ -43,11 +63,10 @@ class SubSpecSDGeneratorBase(ClassicSDGeneratorBase):
         assert batch_size == 1, "Only support batch_size=1 for now."
 
         # Raise error if max_length not set while using static cache
-        if stopping_criteria.max_length is None:
-            if self.cache_implementation == "static":
-                raise ValueError(
-                    "max_length is not set. Only 'dynamic' kv-cache is supported when max_length is unspecified."
-                )
+        if stopping_criteria.max_length is None and self.cache_implementation == "static":
+            raise ValueError(
+                "max_length is not set. Only 'dynamic' kv-cache is supported when max_length is unspecified."
+            )
             
         if model_kwargs.get("past_key_values") is not None:
             past_key_values = model_kwargs["past_key_values"]
@@ -58,6 +77,7 @@ class SubSpecSDGeneratorBase(ClassicSDGeneratorBase):
             raise ValueError("past_key_values is not provided")
 
         stream_callback = model_kwargs.get("stream_callback", None)
+        self._init_step_trace()
 
         with nvtx.annotate("prefill_chunked", color="orange"):
             self._init_tree_mask(
@@ -93,11 +113,13 @@ class SubSpecSDGeneratorBase(ClassicSDGeneratorBase):
                 with nvtx.annotate("speculate", color="cyan"):
                     last_token_id = sampled_tokens[:, -1:].clone(memory_format=torch.contiguous_format)
                     tree = self._speculate(last_token_id)
+                    tree_size_before_cap = int(tree.size())
                     decoded_tree_size = self._cap_tree_to_budget(
                         tree,
                         input_ids,
                         stopping_criteria,
                     )
+                    tree_size_after_cap = int(tree.size())
                     if decoded_tree_size <= 0:
                         break
 
@@ -124,7 +146,7 @@ class SubSpecSDGeneratorBase(ClassicSDGeneratorBase):
 
                 with nvtx.annotate("verify"):
                     root_ind = 0
-                    sampled_tokens, hidden_indices, _ = self._verify(
+                    sampled_tokens, hidden_indices, (_, accept_len) = self._verify(
                         tree,
                         root_ind,
                         next_token_logits,
@@ -133,6 +155,18 @@ class SubSpecSDGeneratorBase(ClassicSDGeneratorBase):
                     )
                     sampled_tokens = sampled_tokens.to(input_ids.device)
                     del next_token_logits
+                    self._append_step_trace(
+                        is_prev_accepted=False,
+                        skip_nodes=0,
+                        tree_size_before_cap=int(tree_size_before_cap),
+                        tree_size_after_cap=int(tree_size_after_cap),
+                        decoded_tree_size=int(decoded_tree_size),
+                        root_ind_in=0,
+                        root_ind_out=-1,
+                        accept_len=int(accept_len),
+                        hidden_indices_len=int(hidden_indices.numel()),
+                        post_verify_used=False,
+                    )
 
                 with nvtx.annotate("state_update"):
                     input_ids = torch.cat([input_ids, sampled_tokens], dim=-1)
@@ -147,15 +181,14 @@ class SubSpecSDGeneratorBase(ClassicSDGeneratorBase):
                     self._maybe_stream(stream_callback, kept)
                 
                 with nvtx.annotate("kv_reorder"):
-                    past_key_values.reorder_cache_with_offset(
-                        hidden_indices,
-                        offset=prev_kv_len,
-                        new_chunk_len=int(decoded_tree_size),
-                        dim=2,
+                    self._commit_target_cache_reorder(
+                        past_key_values,
+                        hidden_indices=hidden_indices,
+                        prev_kv_len=int(prev_kv_len),
+                        decoded_tree_size=int(decoded_tree_size),
+                        finished=bool(finished),
+                        prune_tokens=int(prune_tokens),
                     )
-                    past_key_values.seq_len += hidden_indices.shape[0]
-                    if finished:
-                        past_key_values.seq_len -= prune_tokens
 
         return input_ids
 

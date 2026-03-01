@@ -135,6 +135,7 @@ class SubSpecSDGeneratorBase(ClassicSDGeneratorBase):
             raise ValueError("past_key_values is not provided")
 
         stream_callback = model_kwargs.get("stream_callback", None)
+        self._init_step_trace()
 
         with nvtx.annotate("prefill_chunked", color="orange"):
             self._init_tree_mask(
@@ -148,6 +149,8 @@ class SubSpecSDGeneratorBase(ClassicSDGeneratorBase):
                     self.target_model.config.num_key_value_heads,
                     self.target_model.config.hidden_size,
                     past_key_values.page_len,
+                    # Tree row count can vary across decode rounds; keep planning dynamic.
+                    tree_use_cuda_graph=False,
                 )
             self.kvCachePool = past_key_values
             request_kv_cache = self._ensure_request_kv_cache(
@@ -228,7 +231,7 @@ class SubSpecSDGeneratorBase(ClassicSDGeneratorBase):
 
                 with nvtx.annotate("verify"):
                     root_ind = 0
-                    sampled_tokens, hidden_indices, _ = self._verify(
+                    sampled_tokens, hidden_indices, (_, accept_len) = self._verify(
                         tree,
                         root_ind,
                         next_token_logits,
@@ -237,6 +240,18 @@ class SubSpecSDGeneratorBase(ClassicSDGeneratorBase):
                     )
                     sampled_tokens = sampled_tokens.to(input_ids.device)
                     del next_token_logits
+                    self._append_step_trace(
+                        is_prev_accepted=False,
+                        skip_nodes=0,
+                        tree_size_before_cap=int(tree_size_before_cap),
+                        tree_size_after_cap=int(tree_size_after_cap),
+                        decoded_tree_size=int(decoded_tree_size),
+                        root_ind_in=0,
+                        root_ind_out=-1,
+                        accept_len=int(accept_len),
+                        hidden_indices_len=int(hidden_indices.numel()),
+                        post_verify_used=False,
+                    )
 
                 with nvtx.annotate("kv_reorder"):
                     num_new_tokens = int(decoded_tree_size)

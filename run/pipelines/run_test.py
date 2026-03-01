@@ -11,6 +11,57 @@ from specdecodes.models.utils.wandb_logger import wandb_logger
 from run.pipelines.utils.eval_utils import reset_kv, maybe_init_cuda_graph_runner
 from run.core.config_utils import write_settings_yaml
 
+
+def _build_compact_results(exp_log: dict) -> dict:
+    return {
+        "tput": float(exp_log.get("tput", 0.0) or 0.0),
+        "avg_sampled": float(exp_log.get("avg_sampled", 0.0) or 0.0),
+        "verify_nonterminal_rounds": int(exp_log.get("verify_nonterminal_rounds", 0) or 0),
+        "mean_verify_accept_len_nonterminal": float(
+            exp_log.get("mean_verify_accept_len_nonterminal", 0.0) or 0.0
+        ),
+        "std_verify_accept_len_nonterminal": float(
+            exp_log.get("std_verify_accept_len_nonterminal", 0.0) or 0.0
+        ),
+        "avg_draft_time": float(exp_log.get("avg_draft_time", 0.0) or 0.0),
+        "avg_target_time": float(exp_log.get("avg_target_time", 0.0) or 0.0),
+        "avg_verify_time": float(exp_log.get("avg_verify_time", 0.0) or 0.0),
+        "post_verify_count": int(exp_log.get("post_verify_count", 0) or 0),
+        "speculate_count": int(exp_log.get("speculate_count", 0) or 0),
+        "post_verify_rate": float(exp_log.get("post_verify_rate", 0.0) or 0.0),
+        "is_prev_accepted_count": int(exp_log.get("is_prev_accepted_count", 0) or 0),
+        "is_prev_accepted_steps": int(exp_log.get("is_prev_accepted_steps", 0) or 0),
+        "is_prev_accepted_rate": float(exp_log.get("is_prev_accepted_rate", 0.0) or 0.0),
+        "n_prompt_tokens": int(exp_log.get("n_prompt_tokens", 0) or 0),
+        "n_output_tokens": int(exp_log.get("n_output_tokens", 0) or 0),
+        "elapsed_time": float(exp_log.get("elapsed_time", 0.0) or 0.0),
+        "peak_memory_gib": float(exp_log.get("peak_memory", 0.0) or 0.0),
+    }
+
+
+def _print_compact_results(results: dict) -> None:
+    print("Final run_test Results:")
+    print(f"\tThroughput       : {results['tput']:.3f} tokens/sec")
+    print(f"\tToken Acceptance : {results['avg_sampled']:.3f} (avg_sampled)")
+    rounds = int(results["verify_nonterminal_rounds"])
+    if rounds > 0:
+        print(
+            f"\tVerify Accept Len (nonterminal): {results['mean_verify_accept_len_nonterminal']:.3f} "
+            f"± {results['std_verify_accept_len_nonterminal']:.3f} "
+            f"tokens/verify ({rounds} rounds)"
+        )
+    print(f"\tAvg Draft Time   : {results['avg_draft_time']:.3f} sec")
+    print(f"\tAvg Target Time  : {results['avg_target_time']:.3f} sec")
+    print(f"\tAvg Verify Time  : {results['avg_verify_time']:.3f} sec")
+    print(f"\tPost-Verify Rate : {results['post_verify_rate']:.3f}")
+    print(
+        f"\tPrevAccepted     : {int(results['is_prev_accepted_count'])}/"
+        f"{int(results['is_prev_accepted_steps'])} ({results['is_prev_accepted_rate']:.3f})"
+    )
+    print(f"\tOutput Tokens    : {int(results['n_output_tokens'])}")
+    print(f"\tPeak Memory      : {results['peak_memory_gib']:.3f} GiB")
+
+
 def main(builder):
     generator, tokenizer, past_kv, draft_past_kv = builder.build()
     args = builder.args
@@ -18,6 +69,8 @@ def main(builder):
     # set logging level by environment variable
     LOGLEVEL = os.environ.get("LOGLEVEL", "INFO").upper()
     logging.basicConfig(level=LOGLEVEL)
+    # Suppress verbose per-depth profiling tables in run_test; emit compact summary instead.
+    generator.profiling_verbose = False
 
     # deterministic
     torch.manual_seed(args.seed)
@@ -90,7 +143,14 @@ def main(builder):
     with open(log_file, "a+", encoding="utf-8") as f:
         json.dump(exp_log, f, indent=4)
         f.write("\n")
+
+    compact_results = _build_compact_results(exp_log)
+    results_file = os.path.join(log_dir, "results.jsonl")
+    with open(results_file, "a+", encoding="utf-8") as f:
+        json.dump({"run_test": compact_results}, f, indent=4)
+        f.write("\n")
     print(f"Log directory: {log_dir}")
+    _print_compact_results(compact_results)
 
     if args.print_message:
         print("\nPrompt:")

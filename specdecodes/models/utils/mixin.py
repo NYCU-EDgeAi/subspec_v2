@@ -22,6 +22,9 @@ _PROFILE_LOG_DEFAULTS = {
     "post_verify_count": 0,
     "speculate_count": 0,
     "post_verify_rate": 0.0,
+    "is_prev_accepted_count": 0,
+    "is_prev_accepted_steps": 0,
+    "is_prev_accepted_rate": 0.0,
 }
 
 
@@ -402,6 +405,29 @@ class SDProfilingMixin:
                     "post_verify_count": post_verify_count,
                     "speculate_count": speculate_count,
                     "post_verify_rate": (float(post_verify_count) / float(denom)) if denom > 0 else 0.0,
+                }
+            )
+
+        export_step_trace = getattr(self, "_export_step_trace", None)
+        if callable(export_step_trace):
+            step_trace = export_step_trace()
+            if step_trace is not None:
+                _commit_profile_log({"step_trace": step_trace})
+
+        export_prev_accepted_stats = getattr(self, "_export_is_prev_accepted_stats", None)
+        if callable(export_prev_accepted_stats):
+            prev_accepted_stats = dict(export_prev_accepted_stats())
+            _commit_profile_log(
+                {
+                    "is_prev_accepted_count": int(
+                        prev_accepted_stats.get("is_prev_accepted_count", 0) or 0
+                    ),
+                    "is_prev_accepted_steps": int(
+                        prev_accepted_stats.get("is_prev_accepted_steps", 0) or 0
+                    ),
+                    "is_prev_accepted_rate": float(
+                        prev_accepted_stats.get("is_prev_accepted_rate", 0.0) or 0.0
+                    ),
                 }
             )
 

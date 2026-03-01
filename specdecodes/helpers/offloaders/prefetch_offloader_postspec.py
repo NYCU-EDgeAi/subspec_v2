@@ -185,11 +185,6 @@ class PrefetchOffloader:
         
         return hook
     
-    def _create_pre_draft_hook(self):
-        def hook(module, inputs):
-            self.draft_model.postspec()
-        return hook
-    
     def _create_wait_hook(self, maybe_run_draft: bool = False):
         """Wait for this module's weights via CUDA events (no full-device sync)."""
         def hook(module, inputs):

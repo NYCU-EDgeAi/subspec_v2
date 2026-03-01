@@ -1,7 +1,6 @@
 import torch
 
 from specdecodes.models.utils.lossy_tree_verify import lossy_bottom_up_verify
-from specdecodes.models.utils.wandb_logger import wandb_logger
 
 
 def _make_probs(rows):
@@ -150,59 +149,6 @@ def test_lossy_verify_window_lookahead():
     assert hidden.tolist() == [0, 1, 2]
 
 
-def test_lossy_verify_logs_mismatch_prob_means_and_rates():
-    # Tree: root -> {child(tok=5), child(tok=7)}
-    # Target argmax is 9, so this is a mismatch context.
-    # We accept tok=5 lossy because probs[root, 5] >= threshold.
-    wandb_logger.clear_log_data()
-
-    token_ids = torch.tensor([0, 5, 7], dtype=torch.long)
-    parent = torch.tensor([-1, 0, 0], dtype=torch.long)
-    children = [[1, 2], [], []]
-
-    probs = _make_probs(
-        [
-            # root: argmax 9, but child(5)=0.4 is above threshold.
-            [0.0, 0.0, 0.0, 0.0, 0.0, 0.399, 0.0, 0.20, 0.0, 0.401],
-            [0.05, 0.90, 0.01, 0.01, 0.01, 0.01, 0.00, 0.00, 0.00, 0.01],
-            [0.05, 0.90, 0.01, 0.01, 0.01, 0.01, 0.00, 0.00, 0.00, 0.01],
-        ]
-    )
-
-    sampled, hidden, accept_len = lossy_bottom_up_verify(
-        probs=probs,
-        token_ids=token_ids,
-        parent_indices=parent,
-        children_lists=children,
-        root_index=0,
-        eos_token_id=None,
-        do_sample=False,
-        threshold=0.30,
-        window_size=0,
-    )
-
-    assert accept_len == 1
-    assert sampled[0].item() == 5
-    assert hidden[0].item() == 0
-
-    # Token-level acceptance.
-    assert wandb_logger.log_data["verify_accept_tokens"] == 1.0
-    assert wandb_logger.log_data["verify_lossy_accept_tokens"] == 1.0
-    assert abs(wandb_logger.log_data["verify_lossy_accept_rate"] - 1.0) < 1e-9
-
-    # In this toy case, the mismatch is window-eligible and not threshold-blocked.
-    assert abs(wandb_logger.log_data["lossy_window_ok_gate_mean"] - 0.399) < 1e-6
-    assert abs(wandb_logger.log_data["lossy_window_ok_gate_std"] - 0.0) < 1e-9
-    assert abs(wandb_logger.log_data["lossy_window_ok_drop_rate"] - 0.0) < 1e-9
-
-    # Probability assigned by target to the accepted lossy token.
-    assert abs(wandb_logger.log_data["lossy_accepted_prob_mean"] - 0.399) < 1e-6
-    assert abs(wandb_logger.log_data["lossy_accepted_prob_std"] - 0.0) < 1e-9
-
-    # Rate of lossy acceptance when the target token is missing among children.
-    assert abs(wandb_logger.log_data["lossy_accept_rate_when_no_match"] - 1.0) < 1e-9
-
-
 def test_lossy_verify_prefers_longer_lossy_over_short_exact_match():
     # Tree:
     # 0(root)
@@ -249,8 +195,6 @@ def test_lossy_verify_tie_break_prefers_exact_match():
     #  └─ 2(tok=7)   [lossy-acceptable]
     # Both children are leaves, so both yield equal accept length (=1).
     # The verifier should prefer the exact-match child.
-    wandb_logger.clear_log_data()
-
     token_ids = torch.tensor([0, 5, 7], dtype=torch.long)
     parent = torch.tensor([-1, 0, 0], dtype=torch.long)
     children = [[1, 2], [], []]

@@ -149,6 +149,8 @@ class ClassicSDGeneratorBase(ClassicSDBase):
                     self.target_model.config.num_key_value_heads,
                     self.target_model.config.hidden_size,
                     past_key_values.page_len,
+                    # Tree row count can vary across decode rounds; keep planning dynamic.
+                    tree_use_cuda_graph=False,
                 )
 
             self.kvCachePool = past_key_values

@@ -2,19 +2,14 @@ import torch
 import nvtx
 
 from ..utils.cpu_tree import Tree
-from .base import DraftModelBase, TreeData, TreeMaskCache
+from .base import DraftModelBase, FIFirstStepContract, TreeData, TreeMaskCache
 from copy import deepcopy
 
 from ..utils.flashinfer.cache_manager import (
-    KvCachePool,
-    RequestKvCache,
     KvCacheBatchPosition,
     getKvCacheBatchPosition,
-    FlashInferCache
 )
 from ..utils.flashinfer.attention_wrapper import FlashinferAttentionWrapper
-import numpy as np
-import pathlib 
 
 
 
@@ -31,63 +26,51 @@ class ClassicSDDraftModel(DraftModelBase):
             logits = torch.softmax(logits/self.draft_params.temperature, dim=-1)
             
         return logits
+
+    def _first_step_contract(self) -> FIFirstStepContract:
+        # Classic FI retains the existing first-step behavior:
+        # append `input_len` tokens and run first forward in prefill mode.
+        return FIFirstStepContract(
+            attention_mode="prefill",
+            batch_position_mode="tree",
+            cache_increment="input_len",
+            position_ids_style="arange",
+        )
     
     def init_cuda_graph_runner(
         self,
         device: torch.device,
     ):
-        """
-        Allocate *fixed‑size* staging buffers for a single‑batch, `tree`
-        forward of length `topk_len` and capture it inside a CUDA Graph.
-
-        Call once (e.g. the very first time `speculate` is invoked).
-        """
-        print("draft model has init_cuda_graph_runner. Initializing CUDA Graph runner...")
-        if hasattr(self, "graph"):          # already captured
+        if bool(getattr(self, "_cuda_graph_inited", False)):
             return
 
-        self.decode_chunk_size = self.draft_params.topk_len   # <- used by `tree_step`
-        self.graph              = None
-        self.output_buffer      = None
-        self.model.eval()   
+        self._fi_cuda_graph_reset_state(decode_chunk_size=int(self.draft_params.topk_len))
+        self.model.eval()
         kvCachePool = self.kvCachePool
 
-        # ── staging buffers ───────────────────────────────────────
         B = 1
-        L = self.decode_chunk_size
-        PAGE_LEN = kvCachePool.page_len
+        tree_L = self.decode_chunk_size
 
-        self.input_ids_buf    = torch.zeros((B, L),  dtype=torch.long,  device=device)
-        self.position_ids_buf = torch.zeros((B, L),  dtype=torch.long,  device=device)
-
-        self.seq_indptr_buf        = torch.zeros((B + 1,),          dtype=torch.int32, device=device)
-        self.kv_page_indptr_buf    = torch.zeros((B + 1,),          dtype=torch.int32, device=device)
-        self.kv_page_indices_buf   = torch.zeros((kvCachePool.max_pages,), dtype=torch.int32, device=device)
-        self.kv_last_page_len_buf  = torch.zeros((B,),              dtype=torch.int32, device=device)
-        self.batch_indices_buf     = torch.zeros((L,),              dtype=torch.int32, device=device)
-        self.positions_buf         = torch.zeros((L,),              dtype=torch.int32, device=device)
-
-        self.batch_position = KvCacheBatchPosition(
-            seq_indptr       = self.seq_indptr_buf,
-            kv_page_indptr   = self.kv_page_indptr_buf,
-            kv_page_indices  = self.kv_page_indices_buf,
-            kv_last_page_len = self.kv_last_page_len_buf,
-            batch_indices    = self.batch_indices_buf,
-            positions        = self.positions_buf,
+        self.input_ids_buf = torch.zeros((B, tree_L), dtype=torch.long, device=device)
+        self.position_ids_buf = torch.zeros((B, tree_L), dtype=torch.long, device=device)
+        self._fi_alloc_batch_position_buffers(
+            prefix="",
+            batch_size=B,
+            token_count=tree_L,
+            max_pages=int(kvCachePool.max_pages),
+            device=device,
         )
 
-        # ── Flash‑Infer wrapper (shared weights, no extra allocation) ──
         if not hasattr(self, "flashinferWrapper"):
             raise ValueError("flashinferWrapper not found in draft model.")
-        
+
         stream = torch.cuda.Stream(device=device)
         stream.wait_stream(torch.cuda.current_stream())
 
         with torch.cuda.stream(stream):
-            dummy_tok = torch.zeros((B, L), dtype=torch.long, device=device)
+            dummy_tok = torch.zeros((B, tree_L), dtype=torch.long, device=device)
             dummy_pos = torch.zeros_like(dummy_tok)
 
-            # two warm‑ups (outside the graph)
             for _ in range(2):
                 _ = self(
                     dummy_tok,
@@ -100,8 +83,8 @@ class ClassicSDDraftModel(DraftModelBase):
                 )
 
             torch.cuda.current_stream().wait_stream(stream)
-            cg = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(cg, stream=stream):
+            tree_cg = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(tree_cg, stream=stream):
                 self.output_buffer = self(
                     self.input_ids_buf,
                     with_softmax=True,
@@ -112,8 +95,8 @@ class ClassicSDDraftModel(DraftModelBase):
                     flashinferWrapper=self.flashinferWrapper,
                 )
 
-        self.graph = cg
-        print("finished capturing draft model CUDA graph")
+        self.graph = tree_cg
+        self._cuda_graph_inited = True
 
 
     def tree_step(
@@ -122,31 +105,17 @@ class ClassicSDDraftModel(DraftModelBase):
         position_ids: torch.Tensor,        # [1, L]
         batch_position: KvCacheBatchPosition,
     ):
-        """
-        Copy fresh data into the staging buffers and *replay* the graph.
-        Returns the model outputs captured in `self.output_buffer`.
-        """
-        # basic shape checks
-        B, L = token_ids.shape
-        if B != 1 or L > self.decode_chunk_size:
-            raise ValueError("tree_step expects shape [1, L<=topk_len]")
-
-        # ---- buffer updates ------------------------------------------------
-        self.input_ids_buf[:, :L].copy_(token_ids)
-        self.position_ids_buf[:, :L].copy_(position_ids)
-
-        self.seq_indptr_buf.copy_(batch_position.seq_indptr)
-        self.kv_page_indptr_buf.copy_(batch_position.kv_page_indptr)
-        self.kv_last_page_len_buf.copy_(batch_position.kv_last_page_len)
-        self.batch_indices_buf.copy_(batch_position.batch_indices)
-        self.positions_buf.copy_(batch_position.positions)
-
-        n_pages = batch_position.kv_page_indptr[1].item()
-        self.kv_page_indices_buf[:n_pages].copy_(batch_position.kv_page_indices[:n_pages])
-
-        # ---- replay --------------------------------------------------------
-        self.graph.replay()
-        return self.output_buffer
+        return self._fi_replay_graph_step(
+            prefix="",
+            graph_attr="graph",
+            output_attr="output_buffer",
+            token_ids=token_ids,
+            position_ids=position_ids,
+            batch_position=batch_position,
+            max_tokens=int(self.decode_chunk_size),
+            require_exact_tokens=False,
+            context="classic_sd_fi.tree_step",
+        )
     
     @torch.no_grad()
     def update_tree(self, tree_data):
@@ -173,7 +142,11 @@ class ClassicSDDraftModel(DraftModelBase):
         max_cache_len = None
         if not hasattr(self, 'flashinferWrapper'):
             self.flashinferWrapper = FlashinferAttentionWrapper(
-                self.model.config.num_attention_heads, self.model.config.num_key_value_heads, self.model.config.hidden_size,request_kv_cache.kvCachePool.page_len
+                self.model.config.num_attention_heads,
+                self.model.config.num_key_value_heads,
+                self.model.config.hidden_size,
+                request_kv_cache.kvCachePool.page_len,
+                decode_use_cuda_graph=True,
             )
         self.kvCachePool = request_kv_cache.kvCachePool
 
@@ -191,32 +164,31 @@ class ClassicSDDraftModel(DraftModelBase):
 
         # 3) First forward pass
         with nvtx.annotate("draft_prefill", color="red"):
-            
-            mode = "decode"
-            request_kv_cache.increment(input_len)
-
-            batch_position = getKvCacheBatchPosition(
-                request_kv_caches=[request_kv_cache],
-                mode='tree', 
-                device=input_ids.device,
-                treeTokens=input_len,
+            first_step_contract = self._first_step_contract()
+            batch_position, position_ids = self._fi_prepare_first_step(
+                request_kv_cache=request_kv_cache,
+                kv_len=int(kv_len),
+                input_len=int(input_len),
+                batch_size=int(batch_size),
+                device=device,
+                contract=first_step_contract,
+                get_batch_position_fn=getKvCacheBatchPosition,
             )
             self.flashinferWrapper.prepareAttention(
-                'prefill',
+                first_step_contract.attention_mode,
                 batch_position,
                 self.kvCachePool.page_len,
                 "NONE", # POS_ENCODING_MODE.NONE,
                 self.kvCachePool.cache_data[0].dtype,
-            )
-            position_ids = torch.arange(kv_len, kv_len + input_len, dtype=torch.long, device=device).unsqueeze(0)
+            )  
             sampled_probs = self(
                 input_ids,
                 with_softmax=True,
                 logits_to_keep=1,
-                position_ids = position_ids,
+                position_ids=position_ids,
                 kvCachePool=request_kv_cache.kvCachePool,
                 batch_position=batch_position,
-                mode='prefill',
+                mode=first_step_contract.attention_mode,
                 flashinferWrapper=self.flashinferWrapper,
             )
            
@@ -281,7 +253,7 @@ class ClassicSDDraftModel(DraftModelBase):
                     request_kv_cache.kvCachePool.cache_data[0].dtype,
                     attention_mask=tree_attention_mask,
                 )
-                if hasattr(self, "graph"):
+                if self._fi_graph_enabled("graph"):
                     # use CUDA graph
                     sampled_probs = self.tree_step(
                         token_ids,
@@ -367,7 +339,7 @@ class ClassicSDDraftModel(DraftModelBase):
                 attention_mask=tree_attention_mask,
             )
 
-            if hasattr(self, "graph"):
+            if self._fi_graph_enabled("graph"):
                 # use CUDA graph
                 sampled_probs = self.tree_step(
                     token_ids,

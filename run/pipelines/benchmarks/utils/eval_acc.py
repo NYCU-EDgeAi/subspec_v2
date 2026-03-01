@@ -62,6 +62,7 @@ DATASET_TO_METRIC = {
     "repobench_p": code_sim_score,
 }
 dataset2metric = DATASET_TO_METRIC
+MTBENCH_MAX_GEN_TOKS = 1024
 
 _PROMPT_BUDGET_WARNED: set[tuple[str, int, int]] = set()
 
@@ -146,6 +147,8 @@ def _init_perf():
         "total_verify_nonterminal_rounds": 0,
         "total_verify_nonterminal_weighted_accept_sum": 0.0,
         "total_verify_nonterminal_weighted_second_moment_sum": 0.0,
+        "total_is_prev_accepted_count": 0,
+        "total_is_prev_accepted_steps": 0,
     }
 
 
@@ -173,6 +176,9 @@ def _accum_perf(perf, record):
         * verify_nonterminal_rounds
     )
 
+    perf["total_is_prev_accepted_count"] += int(record.get("is_prev_accepted_count", 0) or 0)
+    perf["total_is_prev_accepted_steps"] += int(record.get("is_prev_accepted_steps", 0) or 0)
+
 
 def _finalize_perf(perf, generator):
     tput_list = perf["tput_list"]
@@ -187,6 +193,8 @@ def _finalize_perf(perf, generator):
     total_verify_nonterminal_weighted_second_moment_sum = float(
         perf["total_verify_nonterminal_weighted_second_moment_sum"]
     )
+    total_is_prev_accepted_count = int(perf["total_is_prev_accepted_count"])
+    total_is_prev_accepted_steps = int(perf["total_is_prev_accepted_steps"])
 
     tput_mean, tput_std = (np.mean(tput_list), np.std(tput_list)) if tput_list else (0, 0)
     tacc_mean, tacc_std = (np.mean(tacc_list), np.std(tacc_list)) if tacc_list else (0, 0)
@@ -206,6 +214,12 @@ def _finalize_perf(perf, generator):
         variance = max(0.0, second_moment - mean_verify_accept_len_nonterminal ** 2)
         std_verify_accept_len_nonterminal = float(variance ** 0.5)
 
+    is_prev_accepted_rate = (
+        float(total_is_prev_accepted_count) / float(total_is_prev_accepted_steps)
+        if total_is_prev_accepted_steps > 0
+        else 0.0
+    )
+
     return {
         "tput_mean": float(tput_mean),
         "tput_std": float(tput_std),
@@ -217,6 +231,9 @@ def _finalize_perf(perf, generator):
         "verify_nonterminal_rounds": total_verify_nonterminal_rounds,
         "mean_verify_accept_len_nonterminal": float(mean_verify_accept_len_nonterminal),
         "std_verify_accept_len_nonterminal": float(std_verify_accept_len_nonterminal),
+        "is_prev_accepted_count": int(total_is_prev_accepted_count),
+        "is_prev_accepted_steps": int(total_is_prev_accepted_steps),
+        "is_prev_accepted_rate": float(is_prev_accepted_rate),
     }
 
 
@@ -267,18 +284,198 @@ def run_mtbench_eval(
     log_dir,
 ):
     """Evaluate multi-turn MT-Bench (generation-only; no reference accuracy)."""
-    # Reuse the legacy multi-turn evaluator implementation to preserve behavior.
-    from .eval import run_mtbench_eval as _run_mtbench_eval_legacy
-
-    return _run_mtbench_eval_legacy(
+    warmup_prompt = "Write an essay about large language models."
+    _run_warmup(
         generator,
         tokenizer,
         past_key_values,
         draft_past_key_values,
         args,
-        dataset,
-        log_dir,
+        warmup_prompt,
+        max_new_tokens=MTBENCH_MAX_GEN_TOKS,
     )
+
+    # Optional CUDA-graph capture for FlashInfer, after warmup (stabilizes kernels/allocations).
+    maybe_init_cuda_graph_runner(generator, past_key_values, draft_past_key_values, args.device, args.warmup_iter)
+
+    log_file = os.path.join(log_dir, "0.jsonl")
+    perf = _init_perf()
+    post_verify_count_list: list[int] = []
+    speculate_count_list: list[int] = []
+
+    for idx, turns in tqdm(enumerate(dataset), total=len(dataset), desc="Evaluating MT-Bench"):
+        messages = []
+        conv_log: Dict[str, Any] = {}
+        conv_n_iter = 0
+        conv_n_tokens = 0
+        conv_elapsed_time = 0.0
+        conv_total_sampled = 0.0
+        conv_total_draft_time = 0.0
+        conv_total_target_time = 0.0
+        conv_total_verify_time = 0.0
+        conv_post_verify_count = 0
+        conv_speculate_count = 0
+        conv_has_post_verify_counter = False
+        conv_verify_nonterminal_rounds = 0
+        conv_verify_nonterminal_weighted_accept_sum = 0.0
+        conv_verify_nonterminal_weighted_second_moment_sum = 0.0
+        conv_is_prev_accepted_count = 0
+        conv_is_prev_accepted_steps = 0
+
+        for tid, query in enumerate(turns):
+            messages.append({"role": "user", "content": query})
+            tokenizer.use_default_system_prompt = True
+            input_ids = tokenizer.apply_chat_template(
+                messages,
+                tokenize=True,
+                add_generation_prompt=True,
+                return_tensors="pt",
+            ).to(generator.device)
+
+            remaining = int(args.max_length) - int(input_ids.shape[1])
+            if remaining <= 0:
+                logging.info(
+                    "Skipping query No.%d (turn %d) due to length %d > max_length %d",
+                    idx,
+                    tid,
+                    int(input_ids.shape[1]),
+                    int(args.max_length),
+                )
+                continue
+            max_new_tokens = min(int(MTBENCH_MAX_GEN_TOKS), int(remaining))
+
+            with sdpa_kernel(backends=[SDPBackend.MATH]):
+                output_ids = generator.generate(
+                    input_ids,
+                    temperature=args.temperature,
+                    max_new_tokens=max_new_tokens,
+                    do_sample=args.do_sample,
+                    past_key_values=past_key_values,
+                    draft_past_key_values=draft_past_key_values,
+                )
+
+            output_message = tokenizer.decode(
+                output_ids[0][input_ids.shape[1]:],
+                skip_special_tokens=True,
+                clean_up_tokenization_spaces=False,
+            )
+            turn_record = dict(wandb_logger.log_data)
+
+            n_iter = int(turn_record.get("n_iter", 0) or 0)
+            n_tokens = int(turn_record.get("n_tokens", 0) or 0)
+            elapsed_time = float(turn_record.get("elapsed_time", 0.0) or 0.0)
+            avg_sampled = float(turn_record.get("avg_sampled", 0.0) or 0.0)
+            avg_draft_time = float(turn_record.get("avg_draft_time", 0.0) or 0.0)
+            avg_target_time = float(turn_record.get("avg_target_time", 0.0) or 0.0)
+            avg_verify_time = float(turn_record.get("avg_verify_time", 0.0) or 0.0)
+
+            conv_n_iter += n_iter
+            conv_n_tokens += n_tokens
+            conv_elapsed_time += elapsed_time
+            conv_total_sampled += avg_sampled * n_iter
+            conv_total_draft_time += avg_draft_time * n_iter
+            conv_total_target_time += avg_target_time * n_iter
+            conv_total_verify_time += avg_verify_time * n_iter
+
+            verify_nonterminal_rounds = int(turn_record.get("verify_nonterminal_rounds", 0) or 0)
+            mean_verify_accept_len_nonterminal = float(
+                turn_record.get("mean_verify_accept_len_nonterminal", 0.0) or 0.0
+            )
+            std_verify_accept_len_nonterminal = float(
+                turn_record.get("std_verify_accept_len_nonterminal", 0.0) or 0.0
+            )
+            conv_verify_nonterminal_rounds += verify_nonterminal_rounds
+            conv_verify_nonterminal_weighted_accept_sum += (
+                mean_verify_accept_len_nonterminal * verify_nonterminal_rounds
+            )
+            conv_verify_nonterminal_weighted_second_moment_sum += (
+                (std_verify_accept_len_nonterminal ** 2 + mean_verify_accept_len_nonterminal ** 2)
+                * verify_nonterminal_rounds
+            )
+
+            conv_is_prev_accepted_count += int(turn_record.get("is_prev_accepted_count", 0) or 0)
+            conv_is_prev_accepted_steps += int(turn_record.get("is_prev_accepted_steps", 0) or 0)
+
+            if "post_verify_count" in turn_record and "speculate_count" in turn_record:
+                conv_has_post_verify_counter = True
+                conv_post_verify_count += int(turn_record.get("post_verify_count", 0) or 0)
+                conv_speculate_count += int(turn_record.get("speculate_count", 0) or 0)
+
+            conv_log[str(tid)] = {
+                **turn_record,
+                "query": query,
+                "response": output_message,
+                "peak_memory": torch.cuda.max_memory_reserved(generator.device) / (1024 ** 3),
+            }
+            messages.append({"role": "assistant", "content": output_message})
+
+            del input_ids, output_ids
+            gc.collect()
+            torch.cuda.empty_cache()
+
+        reset_kv(past_key_values, draft_past_key_values)
+
+        mean_verify_accept_len_nonterminal = 0.0
+        std_verify_accept_len_nonterminal = 0.0
+        if conv_verify_nonterminal_rounds > 0:
+            mean_verify_accept_len_nonterminal = float(
+                conv_verify_nonterminal_weighted_accept_sum / conv_verify_nonterminal_rounds
+            )
+            second_moment = float(
+                conv_verify_nonterminal_weighted_second_moment_sum / conv_verify_nonterminal_rounds
+            )
+            variance = max(0.0, second_moment - mean_verify_accept_len_nonterminal ** 2)
+            std_verify_accept_len_nonterminal = float(variance ** 0.5)
+
+        overall = {
+            "avg_draft_time": (conv_total_draft_time / conv_n_iter) if conv_n_iter > 0 else 0.0,
+            "avg_target_time": (conv_total_target_time / conv_n_iter) if conv_n_iter > 0 else 0.0,
+            "avg_verify_time": (conv_total_verify_time / conv_n_iter) if conv_n_iter > 0 else 0.0,
+            "n_iter": int(conv_n_iter),
+            "n_tokens": int(conv_n_tokens),
+            "avg_sampled": (conv_total_sampled / conv_n_iter) if conv_n_iter > 0 else 0.0,
+            "elapsed_time": float(conv_elapsed_time),
+            "tput": (float(conv_n_tokens) / float(conv_elapsed_time)) if conv_elapsed_time > 0 else 0.0,
+            "verify_nonterminal_rounds": int(conv_verify_nonterminal_rounds),
+            "mean_verify_accept_len_nonterminal": float(mean_verify_accept_len_nonterminal),
+            "std_verify_accept_len_nonterminal": float(std_verify_accept_len_nonterminal),
+            "is_prev_accepted_count": int(conv_is_prev_accepted_count),
+            "is_prev_accepted_steps": int(conv_is_prev_accepted_steps),
+            "is_prev_accepted_rate": (
+                float(conv_is_prev_accepted_count) / float(conv_is_prev_accepted_steps)
+            ) if conv_is_prev_accepted_steps > 0 else 0.0,
+        }
+        if conv_has_post_verify_counter:
+            denom = int(conv_post_verify_count + conv_speculate_count)
+            overall.update(
+                {
+                    "post_verify_count": int(conv_post_verify_count),
+                    "speculate_count": int(conv_speculate_count),
+                    "post_verify_rate": (float(conv_post_verify_count) / float(denom)) if denom > 0 else 0.0,
+                }
+            )
+            post_verify_count_list.append(int(conv_post_verify_count))
+            speculate_count_list.append(int(conv_speculate_count))
+
+        conv_log["overall"] = overall
+        with open(log_file, "a+") as f:
+            json.dump(conv_log, f, indent=4)
+            f.write("\n")
+
+        _accum_perf(perf, overall)
+
+    perf_stats = _finalize_perf(perf, generator)
+    if post_verify_count_list and speculate_count_list:
+        post_verify_total = float(np.sum(post_verify_count_list))
+        speculate_total = float(np.sum(speculate_count_list))
+        denom = post_verify_total + speculate_total
+        perf_stats["post_verify_rate"] = (post_verify_total / denom) if denom > 0 else 0.0
+
+    _print_summary("MT-Bench", perf_stats)
+    if "post_verify_rate" in perf_stats:
+        print(f"\tPost-Verify Rate: {perf_stats['post_verify_rate']:.3f}")
+
+    return perf_stats
 
 
 # ---- GSM8K ---------------------------------------------------------------

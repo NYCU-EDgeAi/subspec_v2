@@ -15,6 +15,152 @@ class ClassicSDGeneratorBase(GeneratorBase):
         super().__init__(*model_args, **kwargs)
         self.generator_kwargs = generator_kwargs or {}
         self.prefill_chunk_size = self.generator_kwargs.get("prefill_chunk_size", None)
+        self.step_trace_enabled = bool(self.generator_kwargs.get("step_trace", False))
+        self.step_trace_debug_verify = bool(
+            self.generator_kwargs.get("step_trace_debug_verify", False)
+        )
+        self._step_trace = None
+        self._step_trace_step = 0
+        self._is_prev_accepted_count = 0
+        self._is_prev_accepted_steps = 0
+
+    def _init_step_trace(self) -> None:
+        self._is_prev_accepted_count = 0
+        self._is_prev_accepted_steps = 0
+        if not self.step_trace_enabled:
+            self._step_trace = None
+            self._step_trace_step = 0
+            return
+        self._step_trace = []
+        self._step_trace_step = 0
+
+    def _append_step_trace(
+        self,
+        *,
+        is_prev_accepted: bool,
+        skip_nodes: int,
+        tree_size_before_cap: int,
+        tree_size_after_cap: int,
+        decoded_tree_size: int,
+        root_ind_in: int,
+        root_ind_out: int,
+        accept_len: int,
+        hidden_indices_len: int,
+        post_verify_used: bool,
+        extra_fields: dict | None = None,
+    ) -> None:
+        self._is_prev_accepted_steps += 1
+        if bool(is_prev_accepted):
+            self._is_prev_accepted_count += 1
+
+        if not self.step_trace_enabled or self._step_trace is None:
+            return
+
+        row = {
+            "step": int(self._step_trace_step),
+            "is_prev_accepted": bool(is_prev_accepted),
+            "skip_nodes": int(skip_nodes),
+            "tree_size_before_cap": int(tree_size_before_cap),
+            "tree_size_after_cap": int(tree_size_after_cap),
+            "decoded_tree_size": int(decoded_tree_size),
+            "root_ind_in": int(root_ind_in),
+            "root_ind_out": int(root_ind_out),
+            "accept_len": int(accept_len),
+            "hidden_indices_len": int(hidden_indices_len),
+            "post_verify_used": bool(post_verify_used),
+        }
+        if extra_fields:
+            for key, value in extra_fields.items():
+                if isinstance(value, bool):
+                    row[str(key)] = bool(value)
+                elif isinstance(value, int):
+                    row[str(key)] = int(value)
+                elif isinstance(value, torch.Tensor) and int(value.numel()) == 1:
+                    scalar = value.item()
+                    if isinstance(scalar, bool):
+                        row[str(key)] = bool(scalar)
+                    else:
+                        row[str(key)] = int(scalar)
+                else:
+                    row[str(key)] = value
+        self._step_trace.append(row)
+        self._step_trace_step += 1
+
+    def _export_step_trace(self):
+        if not self.step_trace_enabled:
+            return None
+        if self._step_trace is None:
+            return []
+        return list(self._step_trace)
+
+    def _export_is_prev_accepted_stats(self) -> dict:
+        total_steps = int(self._is_prev_accepted_steps)
+        accepted_count = int(self._is_prev_accepted_count)
+        return {
+            "is_prev_accepted_count": accepted_count,
+            "is_prev_accepted_steps": total_steps,
+            "is_prev_accepted_rate": (float(accepted_count) / float(total_steps))
+            if total_steps > 0
+            else 0.0,
+        }
+
+    @staticmethod
+    def _weighted_tensor_hash(values: torch.Tensor) -> int:
+        if values is None:
+            return 0
+        flat = values.detach().to(dtype=torch.int64).view(-1).cpu()
+        if int(flat.numel()) == 0:
+            return 0
+        weights = torch.arange(
+            1,
+            int(flat.numel()) + 1,
+            dtype=torch.int64,
+            device=flat.device,
+        )
+        return int((flat * weights).sum().item())
+
+    def _build_verify_debug_trace(
+        self,
+        *,
+        tree,
+        next_token_logits: torch.Tensor | None,
+        skip_nodes: int,
+    ) -> dict:
+        if not (self.step_trace_enabled and self.step_trace_debug_verify):
+            return {}
+
+        node_data = tree.get_tree_data(int(skip_nodes))
+        tree_token_ids = node_data["token_ids"]
+        debug = {
+            "verify_tree_token_count": int(tree_token_ids.numel()),
+            "verify_tree_token_hash": int(self._weighted_tensor_hash(tree_token_ids)),
+        }
+
+        if next_token_logits is None:
+            debug["verify_argmax_len"] = 0
+            debug["verify_argmax_hash"] = 0
+            debug["verify_argmax_last"] = -1
+            return debug
+
+        logits = next_token_logits
+        if int(logits.dim()) == 3:
+            logits = logits[0]
+        argmax_ids = torch.argmax(logits, dim=-1).to(torch.int64)
+        debug["verify_argmax_len"] = int(argmax_ids.numel())
+        debug["verify_argmax_hash"] = int(self._weighted_tensor_hash(argmax_ids))
+        debug["verify_argmax_last"] = (
+            int(argmax_ids[-1].item()) if int(argmax_ids.numel()) > 0 else -1
+        )
+        return debug
+
+    def _tree_token_hash(
+        self,
+        *,
+        tree,
+        skip_nodes: int = 0,
+    ) -> int:
+        node_data = tree.get_tree_data(int(skip_nodes))
+        return int(self._weighted_tensor_hash(node_data["token_ids"]))
         
     def _speculate(self, input_ids):
         return self.draft_model.speculate(input_ids)
