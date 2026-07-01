@@ -1,27 +1,5 @@
-# KV Rewrite example
-method: kv_rewrite
-
-llm_path: meta-llama/Llama-3.1-8B-Instruct
-
-recipe:
-  class_path: specdecodes.helpers.recipes.subspec.hqq_4bit_kv_rewrite:Recipe
-
-max_length: 4096
-cache_implementation: static
-warmup_iter: 1
-compile_mode: max-autotune
-
-# Target sampling settings (defaults)
-do_sample: false
-temperature: 0
-
-generator_profiling: true
-
-generator_kwargs:
-  prefill_chunk_size: 4096
-  verify_method: exact
-  verify_kwargs: {}
+# KV Rewrite sweep point (max_depth=16). Shared settings live in the base.
+extends: _base/kv_rewrite_no_offload.yaml
 
 draft_params:
   max_depth: 16
-  topk_len: 1
