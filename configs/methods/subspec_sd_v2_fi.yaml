@@ -9,7 +9,7 @@ recipe:
 max_length: 4096
 cache_implementation: static
 warmup_iter: 1
-# Required for flashinfer to work correctly
+# flashinfer requires eager mode; torch.compile is disabled
 compile_mode: null
 
 
