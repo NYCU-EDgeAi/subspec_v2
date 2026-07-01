@@ -1,28 +1,7 @@
-# SubSpec SD (v1) deterministic trace
-method: subspec_sd
-
-llm_path: meta-llama/Llama-3.1-8B-Instruct
-
-recipe:
-  class_path: specdecodes.helpers.recipes.subspec.hqq_4bit_postspec:Recipe
-
-max_length: 4096
-cache_implementation: static
-warmup_iter: 1
+# SubSpec SD (v1) deterministic trace.
+# Mirrors subspec_sd.yaml; only disables compile and enables step tracing.
+extends: subspec_sd.yaml
 compile_mode: null
 
-do_sample: false
-temperature: 0
-
-generator_profiling: true
-
 generator_kwargs:
-  prefill_chunk_size: 256
-  verify_method: exact
-  verify_kwargs: {}
   step_trace: true
-
-draft_params:
-  temperature: 0.2
-  max_depth: 32
-  topk_len: 6
