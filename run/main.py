@@ -146,7 +146,7 @@ def _build_settings_snapshot(
     return snapshot
 
 
-def _load_yaml_config(path: str) -> Dict[str, Any]:
+def _load_yaml_config(path: str, _seen: frozenset[str] = frozenset()) -> Dict[str, Any]:
     try:
         import yaml
     except Exception as e:
@@ -154,13 +154,30 @@ def _load_yaml_config(path: str) -> Dict[str, Any]:
             "PyYAML is required for --config. Install it with `pip install pyyaml`."
         ) from e
 
-    with open(path, "r", encoding="utf-8") as f:
+    resolved = os.path.abspath(path)
+    if resolved in _seen:
+        raise ValueError(f"Circular config 'extends' chain detected at {resolved}")
+
+    with open(resolved, "r", encoding="utf-8") as f:
         data = yaml.safe_load(f)
     if data is None:
-        return {}
+        data = {}
     if not isinstance(data, dict):
         raise ValueError(f"YAML config must be a mapping/object at top-level, got {type(data).__name__}")
-    return dict(data)
+    data = dict(data)
+
+    # Optional single-parent inheritance: `extends: <path>` (relative to this
+    # file's directory, or absolute) is deep-merged under the current config so
+    # that near-identical variants (trace/sweep configs) share one source.
+    base_ref = data.pop("extends", None)
+    if base_ref is not None:
+        base_path = os.path.expanduser(str(base_ref))
+        if not os.path.isabs(base_path):
+            base_path = os.path.join(os.path.dirname(resolved), base_path)
+        base_config = _load_yaml_config(base_path, _seen | {resolved})
+        data = _deep_merge_dict(base_config, data)
+
+    return data
 
 
 def _resolve_existing_path(path: str) -> str:
