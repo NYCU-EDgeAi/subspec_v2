@@ -4,15 +4,20 @@ The refactor extracts a `SpecDecodeBackend` and rewrites the per-method `_genera
 loop to drive it. These tests lock in the CURRENT generator output so the refactor
 cannot silently change tokens.
 
-Scope note (why SDPA only, for now):
-- SDPA (`subspec_sd`) greedy decoding is deterministic and works with a small model
-  on CPU-less CUDA without compile — an easy, fast golden captured here.
-- FlashInfer (`subspec_sd_fi`) produces garbage with Llama-3.2-1B even via the real
-  `run-test` entrypoint (kernel/model-config incompatibility at this size), and the
-  8B+compile path is minutes-slow — so there is no cheap FI e2e golden. The FI path
-  is instead guarded by the existing dummy-model unit tests (test_subspec_fi_*,
-  test_fi_request_cache_reuse) plus the backend-adapter unit tests added alongside
-  the extraction. See refactor/backend-seam notes.
+Scope note (which variants have e2e goldens, and why):
+- The v2 algorithm works correctly with a small model (Llama-3.2-1B) for BOTH
+  backends, so both get real e2e goldens here:
+    * subspec_sd_v2    (SDPA)       -> "The capital of France is Paris."
+    * subspec_sd_v2_fi (FlashInfer) -> "The capital of France is currently Paris."
+  (SDPA and FI diverge slightly by design — different attention kernels — so these
+  are per-backend goldens, NOT a cross-backend equality assertion.)
+- subspec_sd (v1 SDPA) also decodes cleanly on 1B and is pinned too.
+- subspec_sd_fi (v1 FlashInfer) produces GARBAGE on 1B even via the real run-test
+  entrypoint, so it has no cheap e2e golden; it is guarded by the existing
+  dummy-model unit tests (test_subspec_fi_*, test_fi_request_cache_reuse).
+
+The FlashInfer goldens require the same warmup + cuda-graph init sequence that
+run_test.main performs, so `_greedy_new_ids` mirrors it exactly.
 
 Gated behind SUBSPEC_RUN_REAL_MODEL_TESTS=1 (matches the repo convention for tests
 that load real weights) and skipped without CUDA.
@@ -34,18 +39,27 @@ pytestmark = [
 GOLDEN_MODEL = "meta-llama/Llama-3.2-1B-Instruct"
 GOLDEN_PROMPT = "What is the capital of France?"
 
-# Golden greedy continuation captured from the current `subspec_sd` generator
-# (commit prior to the backend-seam extraction). "The capital of France is Paris.<eot>"
-GOLDEN_SUBSPEC_SD_IDS = [791, 6864, 315, 9822, 374, 12366, 13, 128009]
+# Golden greedy continuations captured from the CURRENT generators (commit prior to
+# the backend-seam extraction), Llama-3.2-1B, prompt above, warmup+cudagraph setup.
+# NOTE: FlashInfer goldens are sensitive to max_length (paged-cache layout affects
+# kernel numerics), so `n_new` is pinned in `_greedy_new_ids`. Under that fixed config
+# all three are deterministic (verified reproducible run-to-run).
+GOLDENS = {
+    "subspec_sd":       [791, 6864, 315, 9822, 374, 12366, 13, 128009],   # "...is Paris."
+    "subspec_sd_v2":    [791, 6864, 315, 9822, 374, 12366, 13, 128009],   # "...is Paris."
+    "subspec_sd_v2_fi": [791, 6864, 315, 9822, 374, 12366, 13, 128009],   # "...is Paris."
+}
 
 
 def _greedy_new_ids(method: str, *, llm_path: str, prompt: str, n_new: int = 32) -> list[int]:
-    """Build `method` with a fast/deterministic config and return greedy new token ids."""
+    """Build `method` and return greedy new token ids, mirroring run_test.main's
+    warmup + cuda-graph init sequence (required for the FlashInfer path)."""
     from run.core.registry import ModelRegistry
     from run.core.presets import register_presets
     from run.core.configuration import AppConfig
     from run.core.builder import GeneratorPipelineBuilder
     from specdecodes.models.utils.utils import DraftParams
+    from run.pipelines.utils.eval_utils import reset_kv, maybe_init_cuda_graph_runner
     from torch.nn.attention import SDPBackend, sdpa_kernel
 
     register_presets()
@@ -78,15 +92,24 @@ def _greedy_new_ids(method: str, *, llm_path: str, prompt: str, n_new: int = 32)
     ).to(cfg.device)
     max_length = int(input_ids.shape[1]) + n_new
 
-    with sdpa_kernel(backends=[SDPBackend.MATH]):
-        out = generator.generate(
-            input_ids, temperature=0.0, max_length=max_length, do_sample=False,
-            past_key_values=past_kv, draft_past_key_values=draft_past_kv,
-        )
+    def _gen():
+        with sdpa_kernel(backends=[SDPBackend.MATH]):
+            return generator.generate(
+                input_ids, temperature=0.0, max_length=max_length, do_sample=False,
+                past_key_values=past_kv, draft_past_key_values=draft_past_kv,
+            )
+
+    _gen()                                                   # warmup
+    reset_kv(past_kv, draft_past_kv)
+    maybe_init_cuda_graph_runner(generator, past_kv, draft_past_kv, cfg.device, 1)
+    out = _gen()                                             # measured
     return out[0][input_ids.shape[1]:].tolist()
 
 
-def test_subspec_sd_greedy_output_is_stable():
-    """SDPA backend must keep producing the golden greedy continuation through the refactor."""
-    new_ids = _greedy_new_ids("subspec_sd", llm_path=GOLDEN_MODEL, prompt=GOLDEN_PROMPT)
-    assert new_ids == GOLDEN_SUBSPEC_SD_IDS
+@pytest.mark.parametrize("method", list(GOLDENS))
+def test_greedy_output_is_stable(method):
+    """Each backend must keep producing its golden greedy continuation through the refactor."""
+    if method.endswith("_fi"):
+        pytest.importorskip("flashinfer")
+    new_ids = _greedy_new_ids(method, llm_path=GOLDEN_MODEL, prompt=GOLDEN_PROMPT)
+    assert new_ids == GOLDENS[method]
