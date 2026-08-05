@@ -3,6 +3,7 @@ from types import SimpleNamespace
 import torch
 
 from specdecodes.models.generators.base import GeneratorBase
+from specdecodes.models.generators.flashinfer_cache_mixin import FlashInferCacheMixin
 
 
 class _DummyTargetModel(torch.nn.Module):
@@ -20,7 +21,7 @@ class _DummyTokenizer:
     eos_token_id = 2
 
 
-class _DummyGenerator(GeneratorBase):
+class _DummyGenerator(FlashInferCacheMixin, GeneratorBase):
     def _generate(self, *_args, **_kwargs):  # pragma: no cover - not used here
         raise NotImplementedError
 

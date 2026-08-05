@@ -4,6 +4,7 @@ from transformers.generation.stopping_criteria import StoppingCriteria
 import nvtx
 
 from .classic_sd import ClassicSDGeneratorBase
+from .flashinfer_cache_mixin import FlashInferCacheMixin
 from ..utils.mixin import SDProfilingMixin
 from ..utils.flashinfer.cache_manager import (
     RequestKvCache,
@@ -13,7 +14,7 @@ from ..utils.flashinfer.attention_wrapper import FlashinferAttentionWrapper
 from ..utils.flashinfer.prefill import flashinfer_chunked_prefill
 
 
-class SubSpecSDGeneratorBase(ClassicSDGeneratorBase):
+class SubSpecSDGeneratorBase(FlashInferCacheMixin, ClassicSDGeneratorBase):
     def __init__(self, generator_kwargs, *model_args, **kwargs):
         super().__init__(generator_kwargs, *model_args, **kwargs)
 

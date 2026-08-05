@@ -4,6 +4,7 @@ from transformers.generation.stopping_criteria import StoppingCriteria
 import nvtx
 
 from .classic_sd import ClassicSDGeneratorBase
+from .flashinfer_cache_mixin import FlashInferCacheMixin
 from ..utils.mixin import SDProfilingMixin
 from ..utils.flashinfer.cache_manager import (
     KvCacheBatchPosition,
@@ -14,7 +15,7 @@ from ..utils.flashinfer.attention_wrapper import FlashinferAttentionWrapper
 from ..utils.flashinfer.prefill import flashinfer_chunked_prefill
 
 
-class SubSpecSDGeneratorBase(ClassicSDGeneratorBase):
+class SubSpecSDGeneratorBase(FlashInferCacheMixin, ClassicSDGeneratorBase):
     def _build_rewrite_batch_position(
         self,
         request_kv_cache,

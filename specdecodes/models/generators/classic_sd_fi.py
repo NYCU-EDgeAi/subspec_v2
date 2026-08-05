@@ -4,6 +4,7 @@ from transformers.generation.stopping_criteria import StoppingCriteria
 import nvtx
 
 from .classic_sd import ClassicSDGeneratorBase as ClassicSDBase
+from .flashinfer_cache_mixin import FlashInferCacheMixin
 from ..utils.mixin import SDProfilingMixin
 from ..utils.flashinfer.cache_manager import (
     RequestKvCache,
@@ -13,7 +14,7 @@ from ..utils.flashinfer.attention_wrapper import FlashinferAttentionWrapper
 from ..utils.flashinfer.prefill import flashinfer_chunked_prefill
 
 
-class ClassicSDGeneratorBase(ClassicSDBase):
+class ClassicSDGeneratorBase(FlashInferCacheMixin, ClassicSDBase):
     def init_cuda_graph_runner(self, device, kvCachePool=None):
         """
         Initialize the draft model CUDA-graph runner (FlashInfer path only).
