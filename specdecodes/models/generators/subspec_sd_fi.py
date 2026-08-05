@@ -43,6 +43,17 @@ class SubSpecSDGeneratorBase(ClassicSDGeneratorBase):
                 return None
             kvCachePool = request_kv_cache.kvCachePool
 
+            # The draft appends KV only for the levels it forwards, so kv_len may be
+            # short of the full tree footprint. Grow it so the target rewrite window
+            # [kv_len - num_tokens, kv_len) lands exactly on [position_offset, +tree)
+            # instead of eating into committed prefix KV.
+            _target_len = int(position_offset) + int(num_tokens)
+            _cur_len = int(request_kv_cache.get_seq_length())
+            if _cur_len < _target_len:
+                request_kv_cache.increment(_target_len - _cur_len)
+            elif _cur_len > _target_len:
+                request_kv_cache.decrement(_cur_len - _target_len)
+
             batch_position = getKvCacheBatchPosition(
                 request_kv_caches=[request_kv_cache],
                 mode="tree",  # Set to False if you're doing incremental decoding
