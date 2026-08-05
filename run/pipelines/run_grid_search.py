@@ -10,7 +10,7 @@ from tqdm import tqdm
 import itertools
 
 from specdecodes.models.utils.utils import DraftParams
-from run.pipelines.benchmarks.utils.eval import run_common_eval, run_mtbench_eval
+from run.pipelines.benchmarks.utils.eval import run_mtbench_eval
 from run.pipelines.benchmarks.mtbench import load_mtbench_dataset
 from run.core.config_utils import write_settings_yaml
 

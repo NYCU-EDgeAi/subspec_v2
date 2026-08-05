@@ -448,10 +448,6 @@ def _apply_generator_kwargs_overrides(config: AppConfig, config_args: argparse.N
         config.generator_kwargs["verify_kwargs"]["window_size"] = int(config_args.window_size)
 
 
-def _apply_draft_params_overrides(config: AppConfig, config_args: argparse.Namespace) -> None:
-    return
-
-
 def _load_yaml_and_method(args: argparse.Namespace) -> tuple[str, Dict[str, Any], str]:
     try:
         config_path = _resolve_existing_path(args.config)
