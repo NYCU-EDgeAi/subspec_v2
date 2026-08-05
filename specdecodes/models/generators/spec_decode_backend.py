@@ -59,8 +59,15 @@ class SpecDecodeBackend(ABC):
     def speculate(self, last_token_id: torch.LongTensor) -> Any:
         """Run the draft model to propose a candidate tree from ``last_token_id``."""
 
+    def after_cap(self, tree_size_before: int, tree_size_after: int) -> None:
+        """Hook after the tree is capped to budget. FlashInfer rolls back speculative
+        KV writes for the dropped nodes; SDPA is a no-op (the default)."""
+        return None
+
     @abstractmethod
-    def tree_forward(self, tree: Any, *, position_offset: int, device: Any) -> Any:
+    def tree_forward(
+        self, tree: Any, *, position_offset: int, decoded_tree_size: int, device: Any
+    ) -> Any:
         """Run the target model over the (already budget-capped) ``tree`` and return
         its outputs (``.logits`` used by verify). Backends reconcile any draft/tree
         cache-footprint mismatch internally before forwarding."""
