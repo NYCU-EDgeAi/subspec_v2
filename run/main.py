@@ -274,25 +274,6 @@ def _build_base_parser() -> argparse.ArgumentParser:
         help="Path to a YAML config file. Required. Values override method defaults; CLI args override YAML.",
     )
 
-    # Research toggles (parsed early so we can optionally re-exec under Nsight Systems).
-    parser.add_argument(
-        "--nvtx-profiling",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-        help="Enable/disable NVTX profiling via nsys re-exec (overrides YAML)",
-    )
-    parser.add_argument(
-        "--nsys-output",
-        type=str,
-        default=None,
-        help="Nsight Systems output base name (overrides YAML)",
-    )
-    parser.add_argument(
-        "--detailed-analysis",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-        help="Enable/disable detailed analysis logging (overrides YAML)",
-    )
     parser.add_argument(
         "--set",
         dest="set_overrides",
@@ -355,88 +336,13 @@ def _maybe_reexec_with_nsys(enabled: bool, output: str) -> None:
     os.execvp(cmd[0], cmd)
 
 
-def _build_full_parser(base_parser: argparse.ArgumentParser, default_config: Dict[str, Any]) -> argparse.ArgumentParser:
-    full_parser = argparse.ArgumentParser(parents=[base_parser], add_help=False, allow_abbrev=False)
+def _build_full_parser(base_parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
+    """Parser that only separates the top-level flags from the Typer subcommand argv.
 
-    full_parser.add_argument(
-        "--llm-path",
-        type=str,
-        default=default_config.get("llm_path", "meta-llama/Llama-3.1-8B-Instruct"),
-    )
-    full_parser.add_argument("--draft-model-path", type=str, default=default_config.get("draft_model_path", None))
-    full_parser.add_argument("--max-length", type=int, default=default_config.get("max_length", 2048))
-    full_parser.add_argument("--seed", type=int, default=default_config.get("seed", 0))
-    full_parser.add_argument("--device", type=str, default="cuda:0")
-    full_parser.add_argument("--compile-mode", type=str, default=default_config.get("compile_mode", None))
-    full_parser.add_argument("--temperature", type=float, default=default_config.get("temperature", 0.0))
-    full_parser.add_argument("--do-sample", action="store_true", default=default_config.get("do_sample", False))
-    full_parser.add_argument("--warmup-iter", type=int, default=default_config.get("warmup_iter", 0))
-
-    full_parser.add_argument(
-        "--cache-implementation",
-        type=str,
-        choices=["dynamic", "static"],
-        default=default_config.get("cache_implementation", "dynamic"),
-        help="KV-cache mode: dynamic or static",
-    )
-
-    # generator_kwargs overrides
-    default_prefill = (default_config.get("generator_kwargs") or {}).get("prefill_chunk_size", None)
-    full_parser.add_argument(
-        "--prefill-chunk-size",
-        type=int,
-        default=default_prefill,
-        help="Generator prefill chunk size (sets generator_kwargs.prefill_chunk_size)",
-    )
-
-    full_parser.add_argument(
-        "--generator-profiling",
-        action=argparse.BooleanOptionalAction,
-        default=default_config.get("generator_profiling", True),
-        help="Enable/disable generator profiling",
-    )
-
-    default_verify_method = str((default_config.get("generator_kwargs") or {}).get("verify_method", "exact") or "exact").strip().lower()
-    default_threshold_method = str(
-        ((default_config.get("generator_kwargs") or {}).get("verify_kwargs") or {}).get(
-            "threshold_method", "entropy"
-        )
-        or "entropy"
-    ).strip().lower()
-    full_parser.add_argument(
-        "--verify-method",
-        type=str,
-        choices=["exact", "lossy"],
-        default=default_verify_method,
-        help="Verification method for tree-based SD: exact or lossy",
-    )
-
-    full_parser.add_argument(
-        "--threshold",
-        "-e",
-        type=float,
-        default=None,
-        help=(
-            "Lossy verify threshold: entropy gate (h_j < threshold) when threshold_method=entropy, "
-            "or target prob >= threshold when threshold_method=prob"
-        ),
-    )
-    full_parser.add_argument(
-        "--threshold-method",
-        type=str,
-        choices=["entropy", "prob"],
-        default=default_threshold_method,
-        help="Lossy verify threshold method: entropy (paper) or prob (probability)",
-    )
-    full_parser.add_argument(
-        "--window-size",
-        "-w",
-        type=int,
-        default=None,
-        help="Lossy verify: require this many future locally-correct nodes (lookahead)",
-    )
-
-    return full_parser
+    Config fields are set via YAML + ``--set key.path=value`` (see `_build_base_parser`),
+    not per-field CLI flags.
+    """
+    return argparse.ArgumentParser(parents=[base_parser], add_help=False, allow_abbrev=False)
 
 
 def _enforce_benchmark_requires_config(typer_argv: list[str], config_path: str | None) -> None:
@@ -454,48 +360,6 @@ def _resolve_method(cli_method: str | None, yaml_config: Dict[str, Any]) -> str:
     if isinstance(yaml_config.get("method"), str) and yaml_config["method"].strip():
         return yaml_config["method"]
     raise ValueError("Missing `method`: specify --method or set `method:` in the YAML config.")
-
-
-def _apply_cli_overrides(config: AppConfig, config_args: argparse.Namespace) -> None:
-    config.llm_path = config_args.llm_path
-    config.draft_model_path = config_args.draft_model_path
-    config.max_length = int(config_args.max_length)
-    config.seed = int(config_args.seed)
-    config.device = config_args.device
-    config.compile_mode = _normalize_compile_mode(config_args.compile_mode)
-    config.temperature = float(config_args.temperature)
-    config.do_sample = bool(config_args.do_sample)
-    config.warmup_iter = int(config_args.warmup_iter)
-    config.cache_implementation = config_args.cache_implementation
-    config.generator_profiling = bool(config_args.generator_profiling)
-
-    # Optional research toggles: only override when explicitly provided.
-    if getattr(config_args, "detailed_analysis", None) is not None:
-        config.detailed_analysis = bool(config_args.detailed_analysis)
-    if getattr(config_args, "nvtx_profiling", None) is not None:
-        config.nvtx_profiling = bool(config_args.nvtx_profiling)
-    if getattr(config_args, "nsys_output", None) is not None:
-        config.nsys_output = str(config_args.nsys_output)
-
-
-def _apply_generator_kwargs_overrides(config: AppConfig, config_args: argparse.Namespace) -> None:
-    if config.generator_kwargs is None:
-        config.generator_kwargs = {}
-
-    if config_args.prefill_chunk_size is not None:
-        config.generator_kwargs["prefill_chunk_size"] = int(config_args.prefill_chunk_size)
-
-    # Verifier selection + method kwargs.
-    config.generator_kwargs["verify_method"] = str(getattr(config_args, "verify_method", "exact") or "exact").strip().lower()
-    config.generator_kwargs.setdefault("verify_kwargs", {})
-    if getattr(config_args, "threshold", None) is not None:
-        config.generator_kwargs["verify_kwargs"]["threshold"] = float(config_args.threshold)
-    if getattr(config_args, "threshold_method", None) is not None:
-        config.generator_kwargs["verify_kwargs"]["threshold_method"] = str(
-            config_args.threshold_method
-        ).strip().lower()
-    if getattr(config_args, "window_size", None) is not None:
-        config.generator_kwargs["verify_kwargs"]["window_size"] = int(config_args.window_size)
 
 
 def _load_yaml_and_method(args: argparse.Namespace) -> tuple[str, Dict[str, Any], str]:
@@ -516,18 +380,12 @@ def _load_yaml_and_method(args: argparse.Namespace) -> tuple[str, Dict[str, Any]
     return config_path, yaml_config, method
 
 
-def _effective_nsys_settings(args: argparse.Namespace, yaml_config: Dict[str, Any]) -> tuple[bool, str]:
-    enabled = (
-        bool(args.nvtx_profiling)
-        if args.nvtx_profiling is not None
-        else bool(yaml_config.get("nvtx_profiling", False))
+def _effective_nsys_settings(yaml_config: Dict[str, Any]) -> tuple[bool, str]:
+    # nvtx/nsys are configured via YAML or `--set` (already merged into yaml_config here).
+    return (
+        bool(yaml_config.get("nvtx_profiling", False)),
+        str(yaml_config.get("nsys_output", "nsight_report")),
     )
-    output = (
-        str(args.nsys_output)
-        if args.nsys_output is not None
-        else str(yaml_config.get("nsys_output", "nsight_report"))
-    )
-    return enabled, output
 
 
 def _configure_wandb_flags(config: "AppConfig") -> None:
@@ -549,14 +407,10 @@ def _build_app_config(
     AppConfig: type["AppConfig"],
     method: str,
     default_config: Dict[str, Any],
-    config_args: argparse.Namespace,
 ) -> "AppConfig":
     config = AppConfig()
     config.method = method
     config.update(default_config)
-
-    _apply_cli_overrides(config, config_args)
-    _apply_generator_kwargs_overrides(config, config_args)
     return config
 
 
@@ -581,7 +435,7 @@ def main():
         yaml_config = _deep_merge_dict(yaml_config, set_overrides)
 
     # If enabled via YAML/CLI, re-exec under Nsight Systems *before* importing heavy GPU code.
-    nsys_enabled, nsys_output = _effective_nsys_settings(args, yaml_config)
+    nsys_enabled, nsys_output = _effective_nsys_settings(yaml_config)
     _maybe_reexec_with_nsys(nsys_enabled, nsys_output)
 
     # Import project modules lazily so env defaults above apply before any torch/CUDA init.
@@ -607,11 +461,11 @@ def main():
     default_config = _apply_yaml_overrides(default_config, yaml_config)
     
     # 4) Build full parser for AppConfig (method defaults <- YAML; CLI overrides both)
-    full_parser = _build_full_parser(base_parser, default_config)
+    full_parser = _build_full_parser(base_parser)
     
     # Parse again with known args to override defaults
     # We still use parse_known_args because run_app (Typer) needs the rest
-    config_args, typer_argv = full_parser.parse_known_args()
+    _, typer_argv = full_parser.parse_known_args()
 
     # (Kept for backward compatibility + explicit error messaging if this file is reused elsewhere.)
     _enforce_benchmark_requires_config(typer_argv, args.config)
@@ -622,7 +476,6 @@ def main():
             AppConfig=AppConfig,
             method=method,
             default_config=default_config,
-            config_args=config_args,
         )
     except ValueError as e:
         print(f"Error: {e}")

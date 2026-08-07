@@ -15,8 +15,8 @@ def run_pipeline_test(method, device="cuda:0"):
     cmd = [
         sys.executable, "-m", "run.main",
         "--method", method,
-        "--warmup-iter", "0",
-        "--device", device,
+        "--set", "warmup_iter=0",
+        "--set", f"device={device}",
         "run-test"
     ]
     

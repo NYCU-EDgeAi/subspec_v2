@@ -84,8 +84,8 @@ python -m run.main --config configs/methods/classic_sd.yaml run-test
 # Run from an exp_offloading YAML (includes a recipe + per-model offload settings)
 python -m run.main --config configs/exp_offloading/vanilla_qwen_7b.yaml run-test
 
-# Override YAML values from the CLI
-python -m run.main --config configs/methods/classic_sd.yaml --device cuda:1 --warmup-iter 0 run-test
+# Override any config field from the CLI with --set key.path=value (repeatable, nested-aware)
+python -m run.main --config configs/methods/classic_sd.yaml --set device=cuda:1 --set warmup_iter=0 run-test
 ```
 
 Verification is configured via `generator_kwargs.verify_method` and `generator_kwargs.verify_kwargs`.
@@ -101,7 +101,7 @@ generator_kwargs:
     window_size: 6
 ```
 
-CLI equivalents: `--verify-method lossy --threshold-method entropy --threshold <threshold> --window-size <window_size>`.
+CLI equivalents (via `--set`): `--set generator_kwargs.verify_method=lossy --set generator_kwargs.verify_kwargs.threshold_method=entropy --set generator_kwargs.verify_kwargs.threshold=<threshold> --set generator_kwargs.verify_kwargs.window_size=<window_size>`.
 
 Offloading YAML configs parameterize “how many layers remain on GPU” via:
 
@@ -130,12 +130,12 @@ python -m run.main --config configs/methods/<method_name>.yaml run-test
 You can also override via CLI:
 
 ```bash
-python -m run.main --config configs/methods/<method_name>.yaml --nvtx-profiling --nsys-output my_report run-test
+python -m run.main --config configs/methods/<method_name>.yaml --set nvtx_profiling=true --set nsys_output=my_report run-test
 ```
 
 ### Detailed analysis
 
-Enable detailed analysis logging via YAML (or `--detailed-analysis/--no-detailed-analysis`):
+Enable detailed analysis logging via YAML (or `--set detailed_analysis=true`):
 
 ```yaml
 detailed_analysis: true
@@ -153,11 +153,15 @@ The following methods are available (registered in `run/core/presets.py`):
 - ...and others (`subspec_sd_v2`, `subspec_sd_no_offload`, etc.)
 
 ### Common Arguments
-- `--config`: Path to a YAML config (required). CLI args override YAML.
+- `--config`: Path to a YAML config (required).
 - `--method`: Optional override for the YAML `method`.
-- `--device`: Target device (e.g., `cuda:0`, `cuda:1`). Defaults to `cuda:0`.
-- `--warmup-iter`: Number of warmup iterations. Default varies by method (typically 1).
-- `--compile-mode`: Torch compile mode (e.g., `reduce-overhead`, `max-autotune`, or `none`). Defaults to `none`.
+- `--set key.path=value`: Override **any** config field from the CLI (repeatable). The value
+  is parsed as YAML (`16`→int, `true`→bool, `[a,b]`→list); dotted keys nest, so nested config
+  the top-level flags can't reach is settable too. Precedence: `--set` > YAML > method default.
+  Examples: `--set device=cuda:1`, `--set warmup_iter=0`,
+  `--set compile_mode=none` (torch compile: `reduce-overhead` / `max-autotune` / `none`),
+  `--set draft_params.max_depth=8`, `--set generator_kwargs.verify_kwargs.threshold=0.3`.
+  Unknown keys are rejected with a did-you-mean hint.
 
 ## Evaluation
 
@@ -239,12 +243,12 @@ python -m run.main \
 
 **1. Evaluate behavior lane benchmarks on a specific GPU:**
 ```bash
-python -m run.main --config configs/methods/subspec_sd.yaml --device "cuda:0" run-benchmark --benchmarks gsm8k --lane behavior --max-samples 20
+python -m run.main --config configs/methods/subspec_sd.yaml --set device=cuda:0 run-benchmark --benchmarks gsm8k --lane behavior --max-samples 20
 ```
 
 **2. Run a quick test with Classic SD on a different GPU:**
 ```bash
-python -m run.main --config configs/methods/classic_sd.yaml --device "cuda:1" --warmup-iter 0 run-test
+python -m run.main --config configs/methods/classic_sd.yaml --set device=cuda:1 --set warmup_iter=0 run-test
 ```
 
 See [BENCHMARKING.md](BENCHMARKING.md) for:
@@ -308,7 +312,7 @@ python -m run.main --config configs/methods/<method_name>.yaml run-api --host 0.
 
 #### Example: `eagle_sd`
 
-`eagle_sd` requires both a target model (`--llm-path`) and a draft model (`--draft-model-path`). The default draft path in the preset is:
+`eagle_sd` requires both a target model (`--set llm_path=…`) and a draft model (`--set draft_model_path=…`). The default draft path in the preset is:
 
 ```text
 ~/checkpoints/eagle/official/EAGLE-Llama-3.1-8B-Instruct
@@ -319,10 +323,10 @@ Run:
 ```bash
 python -m run.main \
 	--config configs/methods/eagle_sd.yaml \
-	--llm-path meta-llama/Llama-3.1-8B-Instruct \
-	--draft-model-path ~/checkpoints/eagle/official/EAGLE-Llama-3.1-8B-Instruct \
-	--device cuda:0 \
-	--warmup-iter 0 \
+	--set llm_path=meta-llama/Llama-3.1-8B-Instruct \
+	--set draft_model_path=~/checkpoints/eagle/official/EAGLE-Llama-3.1-8B-Instruct \
+	--set device=cuda:0 \
+	--set warmup_iter=0 \
 	run-api --host 0.0.0.0 --port 8000
 ```
 

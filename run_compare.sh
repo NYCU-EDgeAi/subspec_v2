@@ -117,12 +117,12 @@ else
   TOKEN_KL_FLAG=(--no-token-kl)
 fi
 
-MODEL_OVERRIDES=(--max-length "$MAX_LEN")
+MODEL_OVERRIDES=(--set "max_length=$MAX_LEN")
 if [[ -n "$WARMUP_ITER" ]]; then
-  MODEL_OVERRIDES+=(--warmup-iter "$WARMUP_ITER")
+  MODEL_OVERRIDES+=(--set "warmup_iter=$WARMUP_ITER")
 fi
 if [[ "$DISABLE_COMPILE" == "1" ]]; then
-  MODEL_OVERRIDES+=(--compile-mode none)
+  MODEL_OVERRIDES+=(--set "compile_mode=none")
 fi
 
 RAW_METHOD_ITEMS=()
