@@ -1,5 +1,6 @@
 # SubSpec SD (v2 FI) method config
-method: subspec_sd_v2_fi
+method: subspec_sd_v2
+backend: flashinfer
 
 llm_path: meta-llama/Llama-3.1-8B-Instruct
 

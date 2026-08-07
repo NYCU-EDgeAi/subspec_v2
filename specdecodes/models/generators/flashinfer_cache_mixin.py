@@ -1,10 +1,11 @@
 """FlashInfer paged request-cache lifecycle, extracted from GeneratorBase.
 
 These helpers manage the per-session `RequestKvCache` over a paged `kvCachePool` and
-are used ONLY by the FlashInfer generators (subspec_sd_fi, subspec_sd_v2_fi,
-classic_sd_fi). They live in a mixin so the shared `GeneratorBase` stays free of
-FlashInfer concepts. Behaviour is identical to the previous GeneratorBase methods;
-this is a pure relocation.
+are used ONLY on the FlashInfer backend (the `FlashInfer*Backend` adapters call back
+into them, and `classic_sd_fi`). They live in a mixin so the shared `GeneratorBase`
+stays free of FlashInfer concepts and so the unified SubSpec generators can inherit
+them inertly on the SDPA path. Behaviour is identical to the previous GeneratorBase
+methods; this is a pure relocation.
 """
 from __future__ import annotations
 

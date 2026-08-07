@@ -24,7 +24,7 @@ def flashinfer_load_kv_cache(builder, target_model, draft_model):
     past_key_values = FlashInferCache(
         target_model.config, max_tokens=max_cache_len, PAGE_LEN=max_cache_len
     ).kvCachePool
-    entry = ModelRegistry.get(builder.config.method)
+    entry = builder._method_entry()
     needs_draft_kv_cache = bool(getattr(entry, "needs_draft_kv_cache", True)) if entry else True
     draft_past_key_values = None
     if needs_draft_kv_cache:
@@ -43,9 +43,9 @@ def flashinfer_load_draft_model(builder, target_model, tokenizer, draft_model_pa
             "Hint: install it (and its deps), e.g. `pip install flashinfer-python`, then retry."
         ) from e
     
-    # We need to get the class from the registry entry that is currently being used/loaded.
-    # However, builder.config.method gives us the method name.
-    entry = ModelRegistry.get(builder.config.method)
+    # Resolve the draft-model class for the active method AND backend (the FlashInfer
+    # backend of a collapsed method overrides draft_model_cls via `backends=`).
+    entry = builder._method_entry()
     draft_model_cls = entry.get_draft_model_cls() if entry else None
     if draft_model_cls is None:
         raise ImportError(f"Draft model class not registered for method '{builder.config.method}'.")
@@ -116,6 +116,15 @@ def register_presets():
                 "llm_path": "meta-llama/Llama-3.2-1B-Instruct",
             },
             needs_draft_kv_cache=False,
+            # `backend: flashinfer` swaps in the paged draft model + FlashInfer loaders;
+            # same generator/loop, chosen by the SpecDecodeBackend adapter.
+            backends={
+                "flashinfer": {
+                    "draft_model_cls": "specdecodes.models.draft_models.subspec_sd_fi:SubSpecSDDraftModel",
+                    "load_draft_model_fn": flashinfer_load_draft_model,
+                    "load_kv_cache_fn": flashinfer_load_kv_cache,
+                },
+            },
         )
     except ImportError:
         pass
@@ -165,6 +174,15 @@ def register_presets():
                 "llm_path": "meta-llama/Llama-3.1-8B-Instruct",
             },
             needs_draft_kv_cache=False,
+            # `backend: flashinfer` swaps in the paged draft model + FlashInfer loaders;
+            # same generator/loop, chosen by the SpecDecodeBackend adapter.
+            backends={
+                "flashinfer": {
+                    "draft_model_cls": "specdecodes.models.draft_models.subspec_sd_fi:SubSpecSDDraftModel",
+                    "load_draft_model_fn": flashinfer_load_draft_model,
+                    "load_kv_cache_fn": flashinfer_load_kv_cache,
+                },
+            },
         )
     except ImportError:
         pass
@@ -184,52 +202,9 @@ def register_presets():
         load_kv_cache_fn=flashinfer_load_kv_cache,
     )
 
-    # SubSpec SD FlashInfer (lazy import)
-    try:
-        from specdecodes.helpers.recipes.subspec.hqq_4bit_postspec import (
-            Recipe as SubSpecRecipeV1,
-        )
-
-        ModelRegistry.register(
-            name="subspec_sd_fi",
-            generator_cls="specdecodes.models.generators.subspec_sd_fi:SubSpecSDGenerator",
-            draft_model_cls="specdecodes.models.draft_models.subspec_sd_fi:SubSpecSDDraftModel",
-            default_config={
-                "llm_path": "meta-llama/Llama-3.1-8B-Instruct",
-                "recipe": SubSpecRecipeV1(),
-                "backend": "flashinfer",
-            },
-            load_draft_model_fn=flashinfer_load_draft_model,
-            load_kv_cache_fn=flashinfer_load_kv_cache,
-            needs_draft_kv_cache=False,
-        )
-    except ImportError:
-        # If the base SubSpec recipe isn't importable, don't register this method.
-        pass
-
-    # SubSpec SD V2 FlashInfer (lazy import)
-    try:
-        from specdecodes.helpers.recipes.subspec.hqq_4bit_postspec import (
-            Recipe as SubSpecRecipeV2,
-        )
-
-        ModelRegistry.register(
-            name="subspec_sd_v2_fi",
-            generator_cls="specdecodes.models.generators.subspec_sd_v2:SubSpecSDGenerator",
-            draft_model_cls="specdecodes.models.draft_models.subspec_sd_fi:SubSpecSDDraftModel",
-            default_config={
-                "llm_path": "meta-llama/Llama-3.1-8B-Instruct",
-                "recipe": SubSpecRecipeV2(),
-                "backend": "flashinfer",
-            },
-            load_draft_model_fn=flashinfer_load_draft_model,
-            load_kv_cache_fn=flashinfer_load_kv_cache,
-            # Needs a separate draft KV cache.
-            needs_draft_kv_cache=False,
-        )
-    except ImportError:
-        pass
-
+    # NOTE: the SubSpec v1/v2 FlashInfer variants are no longer separate methods; they
+    # are `method: subspec_sd[_v2]` + `backend: flashinfer` (see the `backends=` override
+    # on those entries above). Only the classic FlashInfer twin remains standalone.
 
     # Classic SD Seq
     try:

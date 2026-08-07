@@ -89,11 +89,20 @@ class GeneratorPipelineBuilder:
                 memory_fraction = min(1.0, float(self.vram_limit_gb * (1024**3)) / total_memory)
                 torch.cuda.set_per_process_memory_fraction(memory_fraction, cuda_device)
 
+    def _method_entry(self):
+        """Registry entry for the configured method, resolved for the active backend.
+
+        Applies the entry's per-backend overrides (draft model / load fns / ...) so the
+        rest of the builder is backend-agnostic. Returns None if the method is unknown.
+        """
+        entry = ModelRegistry.get(self.config.method)
+        return entry.for_backend(self.config.backend) if entry else None
+
     def load_model_and_tokenizer(self, model_path: str):
         """
         Load a model and tokenizer from the specified model path.
         """
-        entry = ModelRegistry.get(self.config.method)
+        entry = self._method_entry()
         if entry and entry.load_model_fn:
             return entry.load_model_fn(self, model_path)
 
@@ -114,7 +123,7 @@ class GeneratorPipelineBuilder:
         Load a draft model if a draft model path is provided.
         Returns None if no draft model is needed.
         """
-        entry = ModelRegistry.get(self.config.method)
+        entry = self._method_entry()
         if entry and entry.load_draft_model_fn:
             return entry.load_draft_model_fn(self, target_model, tokenizer, draft_model_path)
 
@@ -132,7 +141,7 @@ class GeneratorPipelineBuilder:
         return None
 
     def load_kv_cache(self, target_model, draft_model):
-        entry = ModelRegistry.get(self.config.method)
+        entry = self._method_entry()
         # If there is no draft model, we never allocate a draft KV cache.
         if draft_model is None:
             if self.cache_implementation == "static":
@@ -197,7 +206,7 @@ class GeneratorPipelineBuilder:
         """
         Initialize the generator with the target model, tokenizer, and draft model.
         """
-        entry = ModelRegistry.get(self.config.method)
+        entry = self._method_entry()
         generator_cls = entry.get_generator_cls() if entry else None
         if generator_cls:
             generator = generator_cls(
@@ -260,7 +269,7 @@ class GeneratorPipelineBuilder:
         fullgraph = not is_flashinfer_method
 
         # Skip target compile when offloading is active or the method opts out.
-        entry = ModelRegistry.get(self.config.method)
+        entry = self._method_entry()
         method_allows_target_compile = bool(getattr(entry, "compile_target", True)) if entry else True
         has_offloader = bool(getattr(self.recipe, "offloader", None))
         if has_offloader or not method_allows_target_compile:

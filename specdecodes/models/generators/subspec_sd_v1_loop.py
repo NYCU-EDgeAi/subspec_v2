@@ -1,14 +1,14 @@
 """Shared v1 SubSpec speculative-decoding loop, driven through a backend seam.
 
-Both generators/subspec_sd.py (SDPA) and generators/subspec_sd_fi.py (FlashInfer)
-had a byte-for-byte-shaped `_generate`; only the KV-cache lifecycle, prefill, and
-attention execution differed. `run_subspec_v1_generate` is that one loop; the two
-`SpecDecodeBackend` adapters below wrap each generator's existing methods, so this is
-a dedup, not a rewrite of the numerics.
-
-The adapters intentionally hold a reference to their generator (`gen`) and delegate to
-its existing helpers (`_tree_decoding`, `_speculate`, `_chunked_prefill_forward`,
-`_ensure_request_kv_cache`, ...). They are internal collaborators, not standalone units.
+One generator class (`generators/subspec_sd.py::SubSpecSDGenerator`) drives this loop for
+both attention backends; the backend is chosen by the `backend:` config field. Each
+`SpecDecodeBackend` adapter below **owns** the KV-cache lifecycle + attention execution
+that differs between SDPA (static/dynamic `Cache`) and FlashInfer (paged `RequestKvCache`):
+`SdpaV1Backend` owns the target-cache reorder, `FlashInferV1Backend` owns the FI tree
+forward + draft speculate. Shared, backend-agnostic helpers (`_verify`,
+`_prepare_tree_inputs_and_mask`, the SDPA `_tree_decoding`/`_speculate` on
+`ClassicSDGeneratorBase`, the FI request-cache mixin) stay on the generator; the adapters
+call back into it via `self.gen`.
 """
 from __future__ import annotations
 
@@ -186,8 +186,28 @@ class SdpaV1Backend(SpecDecodeBackend):
             cache_position=cache_position, device=device,
         )
 
+    def _commit_target_cache_reorder(
+        self,
+        past_key_values,
+        *,
+        hidden_indices: torch.Tensor,
+        prev_kv_len: int,
+        decoded_tree_size: int,
+        finished: bool,
+        prune_tokens: int,
+    ) -> None:
+        past_key_values.reorder_cache_with_offset(
+            hidden_indices,
+            offset=int(prev_kv_len),
+            new_chunk_len=int(decoded_tree_size),
+            dim=2,
+        )
+        past_key_values.seq_len += int(hidden_indices.shape[0])
+        if finished:
+            past_key_values.seq_len -= int(prune_tokens)
+
     def commit(self, *, hidden_indices, prev_kv_len, decoded_tree_size, finished, prune_tokens):
-        self.gen._commit_target_cache_reorder(
+        self._commit_target_cache_reorder(
             self.past_key_values,
             hidden_indices=hidden_indices,
             prev_kv_len=int(prev_kv_len),
@@ -254,7 +274,12 @@ class FlashInferV1Backend(SpecDecodeBackend):
         return self.gen._request_cache_headroom(self.request_kv_cache)
 
     def speculate(self, last_token_id):
-        return self.gen._speculate(last_token_id, self.request_kv_cache)
+        g = self.gen
+        return g.draft_model.speculate(
+            last_token_id,
+            request_kv_cache=self.request_kv_cache,
+            flashinferWrapper=g.flashinferWrapper,
+        )
 
     def after_cap(self, tree_size_before, tree_size_after):
         self.gen._sync_request_cache_after_tree_truncation(
@@ -263,8 +288,74 @@ class FlashInferV1Backend(SpecDecodeBackend):
             tree_size_after=int(tree_size_after),
         )
 
+    def _tree_decoding(self, tree, request_kv_cache, position_offset, cache_position, device):
+        from ..utils.flashinfer.cache_manager import getKvCacheBatchPosition
+
+        g = self.gen
+        tree_input_ids, tree_position_ids, tree_mask = g._prepare_tree_inputs_and_mask(
+            tree,
+            position_offset=position_offset,
+            device=device,
+            model_dtype=g.target_model.model.dtype,
+            non_blocking=True,
+            invert=False,
+        )
+
+        # Target model forward
+        with nvtx.annotate("target_forward", color="red"):
+            num_tokens = int(tree_input_ids.shape[0])
+            if num_tokens == 0:
+                return None
+            kvCachePool = request_kv_cache.kvCachePool
+
+            # The draft appends KV only for the levels it forwards, so kv_len may be
+            # short of the full tree footprint. Grow it so the target rewrite window
+            # [kv_len - num_tokens, kv_len) lands exactly on [position_offset, +tree)
+            # instead of eating into committed prefix KV.
+            _target_len = int(position_offset) + int(num_tokens)
+            _cur_len = int(request_kv_cache.get_seq_length())
+            if _cur_len < _target_len:
+                request_kv_cache.increment(_target_len - _cur_len)
+            elif _cur_len > _target_len:
+                request_kv_cache.decrement(_cur_len - _target_len)
+
+            batch_position = getKvCacheBatchPosition(
+                request_kv_caches=[request_kv_cache],
+                mode="tree",  # Set to False if you're doing incremental decoding
+                device=device,
+                treeTokens=num_tokens,
+            )
+            g.flashinferWrapper.prepareAttention(
+                "tree",
+                batch_position,
+                kvCachePool.page_len,
+                "NONE",  # POS_ENCODING_MODE.NONE,
+                kvCachePool.cache_data[0].dtype,
+                attention_mask=tree_mask,
+            )
+            # Check if the current instance has the attribute 'graph'
+            if hasattr(g, "graph"):
+                outputs = g.tree_decoding_step(
+                    input_ids=tree_input_ids.unsqueeze(0),
+                    position_ids=tree_position_ids.unsqueeze(0),
+                    batch_position=batch_position,
+                )
+            else:
+                outputs = g.target_model(
+                    input_ids=tree_input_ids.unsqueeze(0),
+                    past_key_values=None,
+                    position_ids=tree_position_ids.unsqueeze(0),
+                    output_hidden_states=True,
+                    use_cache=False,
+                    kvCachePool=kvCachePool,
+                    batch_position=batch_position,
+                    mode="tree",
+                    flashinferWrapper=g.flashinferWrapper,
+                )
+        return outputs
+
     def tree_forward(self, tree, *, position_offset, decoded_tree_size, device):
-        return self.gen._tree_decoding(
+        return self._tree_decoding(
             tree, self.request_kv_cache,
             position_offset=position_offset, cache_position=None, device=device,
         )

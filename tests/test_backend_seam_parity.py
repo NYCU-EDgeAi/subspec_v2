@@ -1,20 +1,22 @@
 """Behavioral safety net for the Phase-3 backend-seam refactor.
 
 The refactor extracts a `SpecDecodeBackend` and rewrites the per-method `_generate`
-loop to drive it. These tests lock in the CURRENT generator output so the refactor
-cannot silently change tokens.
+loop to drive it, then collapses each SDPA/FlashInfer generator twin into ONE generator
+selected by the `backend:` config field. These tests lock in the CURRENT generator output
+so the refactor cannot silently change tokens.
 
-Goldens (Llama-3.2-1B, greedy, prompt below), all verified reproducible:
-  - subspec_sd       (v1 SDPA)       "The capital of France is Paris."
-  - subspec_sd_fi    (v1 FlashInfer) "The capital of France is Paris."
-  - subspec_sd_v2    (v2 SDPA)       "The capital of France is Paris."
-  - subspec_sd_v2_fi (v2 FlashInfer) "The capital of France is Paris."
+Goldens (Llama-3.2-1B, greedy, prompt below), keyed by (method, backend), all verified
+reproducible:
+  - subspec_sd    + sdpa        (v1 SDPA)       "The capital of France is Paris."
+  - subspec_sd    + flashinfer  (v1 FlashInfer) "The capital of France is Paris."
+  - subspec_sd_v2 + sdpa        (v2 SDPA)       "The capital of France is Paris."
+  - subspec_sd_v2 + flashinfer  (v2 FlashInfer) "The capital of France is Paris."
 
-subspec_sd_fi previously produced garbage on 1B: its target tree-rewrite window did
-not grow the request cache to the full tree footprint (the draft appends fewer KV
-slots than the tree has nodes), so the window ate into committed prefix KV. Fixed in
-generators/subspec_sd_fi.py by syncing the request cache to `position_offset +
-num_tokens` before the rewrite (mirrors subspec_sd_v2_fi's `_sync_request_cache_to_len`).
+The v1 FlashInfer path previously produced garbage on 1B: its target tree-rewrite window
+did not grow the request cache to the full tree footprint (the draft appends fewer KV
+slots than the tree has nodes), so the window ate into committed prefix KV. Fixed by
+syncing the request cache to `position_offset + num_tokens` before the rewrite (mirrors
+the v2 FlashInfer `_sync_request_cache_to_len`).
 
 SDPA and FlashInfer diverge slightly by design (different attention kernels), so these
 are per-backend goldens, NOT a cross-backend equality assertion. FlashInfer goldens are
@@ -45,16 +47,17 @@ pytestmark = [
 
 GOLDEN_MODEL = "meta-llama/Llama-3.2-1B-Instruct"
 GOLDEN_PROMPT = "What is the capital of France?"
+_PARIS = [791, 6864, 315, 9822, 374, 12366, 13, 128009]  # "...is Paris."
 GOLDENS = {
-    "subspec_sd":       [791, 6864, 315, 9822, 374, 12366, 13, 128009],   # "...is Paris."
-    "subspec_sd_fi":    [791, 6864, 315, 9822, 374, 12366, 13, 128009],   # "...is Paris." (fixed)
-    "subspec_sd_v2":    [791, 6864, 315, 9822, 374, 12366, 13, 128009],   # "...is Paris."
-    "subspec_sd_v2_fi": [791, 6864, 315, 9822, 374, 12366, 13, 128009],   # "...is Paris."
+    ("subspec_sd", "sdpa"):          list(_PARIS),
+    ("subspec_sd", "flashinfer"):    list(_PARIS),   # (v1 FI, fixed)
+    ("subspec_sd_v2", "sdpa"):       list(_PARIS),
+    ("subspec_sd_v2", "flashinfer"): list(_PARIS),
 }
 
 
-def _greedy_new_ids(method: str, *, llm_path: str, prompt: str, n_new: int = 32) -> list[int]:
-    """Build `method` and return greedy new token ids, mirroring run_test.main's
+def _greedy_new_ids(method: str, backend: str, *, llm_path: str, prompt: str, n_new: int = 32) -> list[int]:
+    """Build `method`/`backend` and return greedy new token ids, mirroring run_test.main's
     warmup + cuda-graph init sequence (required for the FlashInfer path).
 
     Intended to run in its own process (see __main__); do not call from an in-process
@@ -74,6 +77,7 @@ def _greedy_new_ids(method: str, *, llm_path: str, prompt: str, n_new: int = 32)
     cfg = AppConfig()
     cfg.method = method
     cfg.update(entry.default_config)          # recipe + defaults
+    cfg.backend = backend
     cfg.llm_path = llm_path
     cfg.device = "cuda:0"
     cfg.dtype = torch.float16
@@ -111,16 +115,16 @@ def _greedy_new_ids(method: str, *, llm_path: str, prompt: str, n_new: int = 32)
     return out[0][input_ids.shape[1]:].tolist()
 
 
-@pytest.mark.parametrize("method", list(GOLDENS))
-def test_greedy_output_is_stable(method):
-    """Each backend must keep producing its golden greedy continuation through the refactor."""
-    if method.endswith("_fi"):
+@pytest.mark.parametrize("method,backend", list(GOLDENS))
+def test_greedy_output_is_stable(method, backend):
+    """Each (method, backend) must keep producing its golden greedy continuation."""
+    if backend == "flashinfer":
         pytest.importorskip("flashinfer")
 
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     env = dict(os.environ, SUBSPEC_RUN_REAL_MODEL_TESTS="1")
     proc = subprocess.run(
-        [sys.executable, os.path.abspath(__file__), method],
+        [sys.executable, os.path.abspath(__file__), method, backend],
         cwd=repo_root, env=env, capture_output=True, text=True, timeout=900,
     )
     new_ids = None
@@ -128,15 +132,16 @@ def test_greedy_output_is_stable(method):
         if line.startswith("NEW_IDS:"):
             new_ids = json.loads(line.split("NEW_IDS:", 1)[1].strip())
     assert new_ids is not None, (
-        f"runner produced no NEW_IDS for {method} (rc={proc.returncode})\n"
+        f"runner produced no NEW_IDS for {method}/{backend} (rc={proc.returncode})\n"
         f"--- stderr tail ---\n{proc.stderr[-3000:]}"
     )
-    assert new_ids == GOLDENS[method]
+    assert new_ids == GOLDENS[(method, backend)]
 
 
 if __name__ == "__main__":
-    # Isolated runner: `python tests/test_backend_seam_parity.py <method>` -> prints NEW_IDS.
+    # Isolated runner: `python tests/test_backend_seam_parity.py <method> <backend>` -> prints NEW_IDS.
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     _method = sys.argv[1]
-    _ids = _greedy_new_ids(_method, llm_path=GOLDEN_MODEL, prompt=GOLDEN_PROMPT)
+    _backend = sys.argv[2]
+    _ids = _greedy_new_ids(_method, _backend, llm_path=GOLDEN_MODEL, prompt=GOLDEN_PROMPT)
     print("NEW_IDS:", json.dumps(_ids))

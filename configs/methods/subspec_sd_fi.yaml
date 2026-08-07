@@ -1,5 +1,6 @@
 # SubSpec SD (v1) example
-method: subspec_sd_fi
+method: subspec_sd
+backend: flashinfer
 
 llm_path: meta-llama/Llama-3.1-8B-Instruct
 

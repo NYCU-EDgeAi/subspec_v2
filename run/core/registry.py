@@ -48,9 +48,43 @@ class ModelRegistryEntry:
     needs_draft_kv_cache: bool = True
     # Whether to compile target model forward for this method.
     compile_target: bool = True
+    # Per-backend field overrides, keyed by the `backend:` config value. Lets one
+    # method entry serve several attention backends (e.g. SDPA + FlashInfer) instead
+    # of registering a twin per backend; `for_backend()` applies the overrides.
+    backends: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
     _resolved_generator_cls: Any = field(default=None, init=False, repr=False, compare=False)
     _resolved_draft_model_cls: Any = field(default=None, init=False, repr=False, compare=False)
+
+    #: Fields a per-backend override block may replace.
+    _BACKEND_OVERRIDABLE = (
+        "generator_cls",
+        "draft_model_cls",
+        "load_model_fn",
+        "load_draft_model_fn",
+        "load_kv_cache_fn",
+        "needs_draft_kv_cache",
+        "compile_target",
+    )
+
+    def for_backend(self, backend: Any) -> "ModelRegistryEntry":
+        """Return this entry with its `backends[backend]` overrides applied.
+
+        Returns ``self`` unchanged when the backend has no override block, so callers
+        can use it unconditionally. Unknown override keys raise (typo guard)."""
+        import dataclasses
+
+        overrides = self.backends.get(str(backend))
+        if not overrides:
+            return self
+        bad = set(overrides) - set(self._BACKEND_OVERRIDABLE)
+        if bad:
+            raise ValueError(
+                f"Unknown per-backend override key(s) for method '{self.name}' "
+                f"backend '{backend}': {sorted(bad)}. "
+                f"Allowed: {sorted(self._BACKEND_OVERRIDABLE)}."
+            )
+        return dataclasses.replace(self, backends={}, **overrides)
 
     def get_generator_cls(self) -> Any:
         if self._resolved_generator_cls is None:
@@ -86,6 +120,7 @@ class ModelRegistry:
         load_kv_cache_fn: Optional[Callable] = None,
         needs_draft_kv_cache: bool = True,
         compile_target: bool = True,
+        backends: Optional[Dict[str, Dict[str, Any]]] = None,
     ) -> None:
         if default_config is None:
             default_config = {}
@@ -99,6 +134,7 @@ class ModelRegistry:
             load_kv_cache_fn=load_kv_cache_fn,
             needs_draft_kv_cache=bool(needs_draft_kv_cache),
             compile_target=bool(compile_target),
+            backends=dict(backends or {}),
         )
 
     @classmethod
