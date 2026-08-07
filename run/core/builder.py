@@ -206,6 +206,7 @@ class GeneratorPipelineBuilder:
                 draft_model=draft_model,
                 draft_params=self.draft_params,
                 cache_implementation=self.cache_implementation,
+                backend=self.config.backend,
                 profiling=self.generator_profiling,
                 profiling_verbose=self.profiling_verbose,
                 generator_kwargs=self.generator_kwargs,
@@ -219,6 +220,7 @@ class GeneratorPipelineBuilder:
             draft_model=draft_model,
             draft_params=self.draft_params,
             cache_implementation=self.cache_implementation,
+            backend=self.config.backend,
             profiling=self.generator_profiling,
             profiling_verbose=self.profiling_verbose,
             generator_kwargs=self.generator_kwargs,
@@ -253,10 +255,8 @@ class GeneratorPipelineBuilder:
 
         logging.info(f"Compiling generator with mode: {self.compile_mode}")
 
-        # FlashInfer methods generally require fullgraph=False to work.
-        # Match _fi, _fi2, _fi3, etc. patterns
-        method_name = str(getattr(self.config, "method", ""))
-        is_flashinfer_method = "_fi" in method_name
+        # FlashInfer backends generally require fullgraph=False to work.
+        is_flashinfer_method = str(getattr(self.config, "backend", "sdpa")) == "flashinfer"
         fullgraph = not is_flashinfer_method
 
         # Skip target compile when offloading is active or the method opts out.

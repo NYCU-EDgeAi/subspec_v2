@@ -1,12 +1,19 @@
+"""Unit tests for the v2 post-verify backend logic.
+
+Since the backend-seam collapse, the SDPA/FlashInfer KV-cache + attention methods live
+on the `SubSpecV2Backend` adapters (`SdpaV2Backend` / `FlashInferV2Backend`), not on the
+generator. These tests build a bare unified generator, wrap it in the relevant adapter,
+and exercise the adapter's `_post_verify` / `_draft_tree_decoding` / `_build_rewrite_batch_position`
+/ `_commit_seed_postspec_before_post_verify` directly.
+"""
 from types import SimpleNamespace
 
 import torch
 
-from specdecodes.models.generators.subspec_sd_v2 import (
-    SubSpecSDGeneratorBase as SubSpecV2GeneratorBase,
-)
-from specdecodes.models.generators.subspec_sd_v2_fi import (
-    SubSpecSDGeneratorBase as SubSpecV2FIGeneratorBase,
+from specdecodes.models.generators.subspec_sd_v2 import SubSpecSDGeneratorBase
+from specdecodes.models.generators.subspec_sd_v2_loop import (
+    SdpaV2Backend,
+    FlashInferV2Backend,
 )
 
 
@@ -76,22 +83,12 @@ class _DummyDraftModel:
         return self._tree_ref
 
 
-def _make_generator(base_cls):
-    gen = base_cls.__new__(base_cls)
+def _make_bare_generator():
+    """A generator instance with just the attributes the adapter methods read."""
+    gen = SubSpecSDGeneratorBase.__new__(SubSpecSDGeneratorBase)
     gen.draft_params = SimpleNamespace(max_depth=4)
     gen.draft_model = _DummyDraftModel()
     gen.post_verify_count = 0
-    if base_cls is SubSpecV2FIGeneratorBase:
-        def _fi_draft_tree_decoding(*args, **kwargs):
-            request_kv_cache = args[1]
-            decoded_tokens = 3
-            if kwargs.get("append_tokens", True):
-                request_kv_cache.increment(decoded_tokens)
-            return torch.zeros((1, decoded_tokens, 10)), decoded_tokens
-
-        gen._draft_tree_decoding = _fi_draft_tree_decoding
-    else:
-        gen._draft_tree_decoding = lambda *args, **kwargs: torch.zeros((1, 3, 10))
     # sampled_tokens has len=3, but accept_len returned by verifier is 2
     gen._verify = (
         lambda *args, **kwargs: (
@@ -103,12 +100,34 @@ def _make_generator(base_cls):
     return gen
 
 
+def _make_sdpa_backend():
+    gen = _make_bare_generator()
+    backend = SdpaV2Backend(gen)
+    backend._draft_tree_decoding = lambda *args, **kwargs: torch.zeros((1, 3, 10))
+    return gen, backend
+
+
+def _make_fi_backend():
+    gen = _make_bare_generator()
+    backend = FlashInferV2Backend(gen)
+
+    def _fi_draft_tree_decoding(*args, **kwargs):
+        request_kv_cache = args[1]
+        decoded_tokens = 3
+        if kwargs.get("append_tokens", True):
+            request_kv_cache.increment(decoded_tokens)
+        return torch.zeros((1, decoded_tokens, 10)), decoded_tokens
+
+    backend._draft_tree_decoding = _fi_draft_tree_decoding
+    return gen, backend
+
+
 def test_subspec_v2_postverify_prunes_by_accept_len():
-    gen = _make_generator(SubSpecV2GeneratorBase)
+    gen, backend = _make_sdpa_backend()
     tree = _DummyTree()
     gen.draft_model._tree_ref = tree
 
-    out_tree, kept_old_indices = gen._post_verify(
+    out_tree, kept_old_indices = backend._post_verify(
         tree=tree,
         root_ind=0,
         past_key_values=None,
@@ -128,13 +147,13 @@ def test_subspec_v2_postverify_prunes_by_accept_len():
 
 
 def test_subspec_v2_fi_postverify_prunes_by_accept_len():
-    gen = _make_generator(SubSpecV2FIGeneratorBase)
+    gen, backend = _make_fi_backend()
     gen.post_verify_count = 0
     tree = _DummyTree()
     gen.draft_model._tree_ref = tree
     request_kv_cache = _DummyRequestCache(seq_len=3)
 
-    out_tree, kept_old_indices = gen._post_verify(
+    out_tree, kept_old_indices = backend._post_verify(
         tree=tree,
         root_ind=0,
         request_kv_cache=request_kv_cache,
@@ -196,9 +215,10 @@ class _AssertingDraftModel(_DummyDraftModel):
 
 
 def test_subspec_v2_fi_postverify_syncs_request_cache_after_prune_before_postspec():
-    gen = SubSpecV2FIGeneratorBase.__new__(SubSpecV2FIGeneratorBase)
+    gen = SubSpecSDGeneratorBase.__new__(SubSpecSDGeneratorBase)
     gen.draft_params = SimpleNamespace(max_depth=4)
     gen.post_verify_count = 0
+    backend = FlashInferV2Backend(gen)
 
     tree = _PruningTree(size_before=5, size_after=2)
     request_kv_cache = _DummyRequestCache(seq_len=0)
@@ -214,7 +234,7 @@ def test_subspec_v2_fi_postverify_syncs_request_cache_after_prune_before_postspe
             request_kv_cache.increment(decoded_tokens)
         return torch.zeros((1, decoded_tokens, 10)), decoded_tokens
 
-    gen._draft_tree_decoding = _fi_draft_tree_decoding
+    backend._draft_tree_decoding = _fi_draft_tree_decoding
     gen._verify = (
         lambda *args, **kwargs: (
             torch.tensor([[11, 22]], dtype=torch.long),
@@ -223,7 +243,7 @@ def test_subspec_v2_fi_postverify_syncs_request_cache_after_prune_before_postspe
         )
     )
 
-    out_tree, _ = gen._post_verify(
+    out_tree, _ = backend._post_verify(
         tree=tree,
         root_ind=0,
         request_kv_cache=request_kv_cache,
@@ -241,10 +261,11 @@ def test_subspec_v2_fi_postverify_syncs_request_cache_after_prune_before_postspe
 
 
 def test_subspec_v2_fi_rewrite_batch_position_targets_trailing_window():
-    gen = SubSpecV2FIGeneratorBase.__new__(SubSpecV2FIGeneratorBase)
+    gen = SubSpecSDGeneratorBase.__new__(SubSpecSDGeneratorBase)
+    backend = FlashInferV2Backend(gen)
     request_kv_cache = _DummyRequestCache(seq_len=26, page_len=16)
 
-    batch_position = gen._build_rewrite_batch_position(
+    batch_position = backend._build_rewrite_batch_position(
         request_kv_cache,
         num_tokens=6,
         device=torch.device("cpu"),
@@ -257,15 +278,16 @@ def test_subspec_v2_fi_rewrite_batch_position_targets_trailing_window():
 
 
 def test_subspec_v2_fi_commit_seed_rebuilds_frontier_from_committed_boundary():
-    gen = SubSpecV2FIGeneratorBase.__new__(SubSpecV2FIGeneratorBase)
+    gen = SubSpecSDGeneratorBase.__new__(SubSpecSDGeneratorBase)
     gen.draft_params = SimpleNamespace(max_depth=4, topk_len=6)
     gen.post_verify_count = 0
+    backend = FlashInferV2Backend(gen)
     tree = _FixedTree(size=5)
     request_kv_cache = _DummyRequestCache(seq_len=11)
     gen.draft_model = _DummyDraftModel()
     gen.draft_model._tree_ref = tree
 
-    out_tree = gen._commit_seed_postspec_before_post_verify(
+    out_tree = backend._commit_seed_postspec_before_post_verify(
         tree=tree,
         request_kv_cache=request_kv_cache,
         position_offset=10,
@@ -280,11 +302,12 @@ def test_subspec_v2_fi_commit_seed_rebuilds_frontier_from_committed_boundary():
 
 
 def test_subspec_v2_fi_postverify_debug_emits_rewrite_invariants():
-    gen = SubSpecV2FIGeneratorBase.__new__(SubSpecV2FIGeneratorBase)
+    gen = SubSpecSDGeneratorBase.__new__(SubSpecSDGeneratorBase)
     gen.draft_params = SimpleNamespace(max_depth=4)
     gen.post_verify_count = 0
     gen.step_trace_enabled = True
     gen.step_trace_debug_verify = True
+    backend = FlashInferV2Backend(gen)
 
     tree = _PruningTree(size_before=5, size_after=3)
     request_kv_cache = _DummyRequestCache(seq_len=13)
@@ -300,7 +323,7 @@ def test_subspec_v2_fi_postverify_debug_emits_rewrite_invariants():
             request_kv_cache.increment(decoded_tokens)
         return torch.zeros((1, decoded_tokens, 10)), decoded_tokens
 
-    gen._draft_tree_decoding = _fi_draft_tree_decoding
+    backend._draft_tree_decoding = _fi_draft_tree_decoding
     gen._verify = (
         lambda *args, **kwargs: (
             torch.tensor([[11, 22, 33]], dtype=torch.long),
@@ -309,7 +332,7 @@ def test_subspec_v2_fi_postverify_debug_emits_rewrite_invariants():
         )
     )
 
-    out_tree, _ = gen._post_verify(
+    out_tree, _ = backend._post_verify(
         tree=tree,
         root_ind=0,
         request_kv_cache=request_kv_cache,

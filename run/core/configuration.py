@@ -7,6 +7,10 @@ from specdecodes.models.utils.utils import DraftParams
 class AppConfig:
     # Base configurations
     method: str = "classic_sd"
+    # Attention/KV-cache backend the generator drives. "sdpa" (static/dynamic Cache)
+    # or "flashinfer" (paged RequestKvCache). Selects the SpecDecodeBackend adapter for
+    # methods that support the seam; FI registry entries default it to "flashinfer".
+    backend: str = "sdpa"
     vram_limit_gb: Optional[int] = None
     seed: int = 0
     device: str = "cuda:0"

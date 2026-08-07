@@ -10,10 +10,13 @@ from specdecodes.models.utils.cache_utils import TreeDynamicCache, TreeStaticCac
 # https://github.com/huggingface/transformers/blob/main/src/transformers/generation/utils.py
 # Several functions are simplified from GenerationMixin class.
 class GeneratorBase(nn.Module):
-    def __init__(self, target_model, tokenizer, draft_model=None, draft_params=None, cache_implementation="dynamic", **generator_kwargs):
+    def __init__(self, target_model, tokenizer, draft_model=None, draft_params=None, cache_implementation="dynamic", backend: str = "sdpa", **generator_kwargs):
         super().__init__()
         self.target_model = target_model
         self.tokenizer = tokenizer
+        # Attention/KV-cache backend ("sdpa" | "flashinfer"); generators that support
+        # the SpecDecodeBackend seam use it to select their adapter.
+        self.backend = str(backend or "sdpa")
 
         if draft_model is not None:
             self.draft_model = draft_model

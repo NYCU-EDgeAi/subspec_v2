@@ -178,6 +178,7 @@ def register_presets():
             "llm_path": "meta-llama/Llama-3.1-8B-Instruct",
             "draft_model_path": "meta-llama/Llama-3.2-1B-Instruct",
             "recipe": None,
+            "backend": "flashinfer",
         },
         load_draft_model_fn=flashinfer_load_draft_model,
         load_kv_cache_fn=flashinfer_load_kv_cache,
@@ -196,6 +197,7 @@ def register_presets():
             default_config={
                 "llm_path": "meta-llama/Llama-3.1-8B-Instruct",
                 "recipe": SubSpecRecipeV1(),
+                "backend": "flashinfer",
             },
             load_draft_model_fn=flashinfer_load_draft_model,
             load_kv_cache_fn=flashinfer_load_kv_cache,
@@ -213,11 +215,12 @@ def register_presets():
 
         ModelRegistry.register(
             name="subspec_sd_v2_fi",
-            generator_cls="specdecodes.models.generators.subspec_sd_v2_fi:SubSpecSDGenerator",
+            generator_cls="specdecodes.models.generators.subspec_sd_v2:SubSpecSDGenerator",
             draft_model_cls="specdecodes.models.draft_models.subspec_sd_fi:SubSpecSDDraftModel",
             default_config={
                 "llm_path": "meta-llama/Llama-3.1-8B-Instruct",
                 "recipe": SubSpecRecipeV2(),
+                "backend": "flashinfer",
             },
             load_draft_model_fn=flashinfer_load_draft_model,
             load_kv_cache_fn=flashinfer_load_kv_cache,

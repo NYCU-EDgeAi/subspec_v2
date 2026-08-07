@@ -1,10 +1,12 @@
 """Shared v2 SubSpec (post-verify) speculative-decoding loop, behind a backend seam.
 
-generators/subspec_sd_v2.py (SDPA) and generators/subspec_sd_v2_fi.py (FlashInfer)
-carried the same-shaped post-verify `_generate`; only KV-cache lifecycle, prefill, and
-attention execution differed. `run_subspec_v2_generate` is that one loop; the two
-`SubSpecV2Backend` adapters below wrap each generator's existing methods, so this is a
-dedup, not a rewrite of the numerics.
+One generator class (`generators/subspec_sd_v2.py::SubSpecSDGenerator`) drives this loop
+for both attention backends; the backend is chosen by the `backend:` config field. Each
+`SubSpecV2Backend` adapter below **owns** the backend-specific KV-cache lifecycle, prefill,
+and attention execution (SDPA static/dynamic `Cache` vs FlashInfer paged `RequestKvCache`).
+The generator holds only the shared algorithm helpers (`_verify`,
+`_prepare_tree_inputs_and_mask`, `_cap_tree_to_budget`, step-trace, ...); the adapters call
+back into it via `self.gen` for those.
 
 The v2 loop is *not* the clean parallel the v1 pair was: v2_fi has control-flow-mutating
 divergences the shared loop models through backend hooks — FI-only request-cache syncs at
@@ -15,10 +17,9 @@ several points (`sync_to_tree`), an FI-only commit-seed postspec step before pos
 (`reorder_tail`, which RETURNS the updated `(root_ind, is_prev_accepted,
 hidden_indices_cache)`). SDPA's implementations of those hooks are the identity/no-op.
 
-This mirrors the v1 seam (generators/subspec_sd_v1_loop.py). The adapters intentionally
-hold a reference to their generator (`gen`) and delegate to its existing helpers; they are
-internal collaborators, not standalone units. Its own ABC (not the v1
-`SpecDecodeBackend`): the v2 hook set is wider and differently typed, so co-locating the
+The adapters' backend methods (`_tree_decoding`, `_post_verify`, `_draft_tree_decoding`, ...)
+keep explicit cache arguments so they stay unit-testable in isolation. Its own ABC (not the
+v1 `SpecDecodeBackend`): the v2 hook set is wider and differently typed, so co-locating the
 contract with its only consumer avoids stub methods on the v1 anchor.
 """
 from __future__ import annotations
@@ -364,6 +365,7 @@ def run_subspec_v2_generate(
 
 # --------------------------------------------------------------------------- #
 # SDPA / static-cache adapter. Unbounded-by-default; threads `cache_position`.
+# Owns the SDPA KV-cache + attention methods (were on the SDPA generator).
 # --------------------------------------------------------------------------- #
 class SdpaV2Backend(SubSpecV2Backend):
     method_name = "subspec_sd_v2"
@@ -373,6 +375,142 @@ class SdpaV2Backend(SubSpecV2Backend):
         self.past_key_values = None
         self.max_cache_len = None
 
+    # ----- backend-specific methods (relocated from the SDPA generator) ----- #
+    def _draft_tree_decoding(self, tree, past_key_values, position_offset, cache_position, skip_nodes, device):
+        g = self.gen
+        tree_input_ids, tree_position_ids, tree_mask = g._prepare_tree_inputs_and_mask(
+            tree,
+            position_offset=position_offset,
+            device=device,
+            model_dtype=g.draft_model.model.dtype,
+            skip_nodes=skip_nodes,
+            invert=True,
+        )
+        with nvtx.annotate("draft_forward", color="red"):
+            next_token_logits = g.draft_model(
+                tree_input_ids.unsqueeze(0),
+                past_key_values=past_key_values.cache,
+                attention_mask=tree_mask,
+                position_ids=tree_position_ids.unsqueeze(0),
+                cache_position=cache_position,
+            )
+        return next_token_logits
+
+    def _post_verify(self, tree, root_ind, past_key_values, position_offset, cache_position, last_tree_depth, skip_nodes, logits_processor, device):
+        g = self.gen
+        verify_tokens_expected = max(0, int(tree.size()) - int(skip_nodes))
+        if int(verify_tokens_expected) <= 0:
+            return tree, None
+
+        next_token_logits = self._draft_tree_decoding(
+            tree,
+            past_key_values,
+            position_offset=position_offset,
+            cache_position=cache_position,
+            skip_nodes=skip_nodes,
+            device=device,
+        )
+        _, _, (_, accept_len) = g._verify(
+            tree,
+            root_ind,
+            next_token_logits,
+            logits_processor,
+            False,
+            skip_nodes=skip_nodes,
+        )
+
+        accept_len = int(accept_len)
+        kept_old_indices = tree.prune_to_depth(int(last_tree_depth) + accept_len)
+
+        # Speculate to refill the tree.
+        refill_steps = int(g.draft_params.max_depth) - accept_len
+        if refill_steps > 0:
+            with nvtx.annotate("postspec_refill", color="cyan"):
+                g.draft_model.init_postspec()
+                for _ in range(refill_steps):
+                    if not g.draft_model.postspec():
+                        break
+            tree = g.draft_model.update_tree_after_post()
+
+        g.post_verify_count += 1
+        return tree, kept_old_indices
+
+    def _tree_decoding(self, tree, past_key_values, position_offset, cache_position, skip_nodes, device):
+        g = self.gen
+        # Disable draft profiling during target forward
+        if g.profiling:
+            g.profile_draft_time = False
+
+        tree_input_ids, tree_position_ids, tree_mask = g._prepare_tree_inputs_and_mask(
+            tree,
+            position_offset=position_offset,
+            device=device,
+            model_dtype=g.target_model.model.dtype,
+            skip_nodes=skip_nodes,
+            invert=True,
+        )
+
+        with nvtx.annotate("target_forward", color="red"):
+            outputs = g.target_model(
+                tree_input_ids.unsqueeze(0),
+                past_key_values=past_key_values.cache,
+                attention_mask=tree_mask,
+                position_ids=tree_position_ids.unsqueeze(0),
+                cache_position=cache_position,
+            )
+
+        if g.profiling:
+            g.profile_draft_time = True
+        return outputs
+
+    def _reorder_pending_tree_cache(self, past_key_values, hidden_indices, pending_tree_size: int, *, input_len: int) -> None:
+        g = self.gen
+        if hidden_indices is None or int(hidden_indices.numel()) <= 0:
+            raise RuntimeError("Deferred reorder expected non-empty hidden_indices_cache in subspec_sd_v2.")
+
+        pending_tree_size = g._resolve_pending_chunk_size(
+            hidden_indices,
+            int(pending_tree_size),
+        )
+        max_hidden_idx = int(hidden_indices.max().item())
+        if max_hidden_idx >= int(pending_tree_size):
+            raise RuntimeError(
+                "Invalid deferred-reorder indices in subspec_sd_v2: "
+                f"max_hidden_idx={max_hidden_idx}, pending_tree_size={int(pending_tree_size)}, "
+                f"seq_len={int(past_key_values.get_seq_length())}, input_len={int(input_len)}"
+            )
+
+        max_cache_len = getattr(past_key_values.cache, "max_cache_len", None)
+        if max_cache_len is not None:
+            base_offset = int(past_key_values.get_seq_length())
+            src_max = base_offset + max_hidden_idx
+            dest_max = base_offset + int(hidden_indices.size(0)) - 1
+            if max(src_max, dest_max) >= int(max_cache_len):
+                raise RuntimeError(
+                    "Deferred reorder would read/write beyond static cache in subspec_sd_v2: "
+                    f"src_max={src_max}, dest_max={dest_max}, max_cache_len={int(max_cache_len)}, "
+                    f"seq_len={int(past_key_values.get_seq_length())}, max_hidden_idx={max_hidden_idx}"
+                )
+
+        past_key_values.reorder_cache_with_offset(
+            hidden_indices,
+            offset=past_key_values.get_seq_length(),
+            new_chunk_len=pending_tree_size,
+            dim=2,
+        )
+        past_key_values.seq_len += hidden_indices.shape[0]
+
+    def _flush_deferred_tree_cache(self, past_key_values, hidden_indices_cache, tree_size: int, *, input_len: int):
+        with nvtx.annotate("kv_reorder"):
+            self._reorder_pending_tree_cache(
+                past_key_values,
+                hidden_indices_cache,
+                int(tree_size),
+                input_len=int(input_len),
+            )
+        return 0, False, None
+
+    # ----- SubSpecV2Backend hooks ----- #
     def begin(self, input_ids, past_key_values):
         g = self.gen
         self.past_key_values = past_key_values
@@ -401,7 +539,7 @@ class SdpaV2Backend(SubSpecV2Backend):
         return self.max_cache_len
 
     def flush_deferred(self, hidden_indices_cache, tree_size, *, input_len):
-        return self.gen._flush_deferred_tree_cache(
+        return self._flush_deferred_tree_cache(
             self.past_key_values,
             hidden_indices_cache,
             int(tree_size),
@@ -415,7 +553,7 @@ class SdpaV2Backend(SubSpecV2Backend):
             dtype=torch.long,
             device=device,
         )
-        return self.gen._post_verify(
+        return self._post_verify(
             tree,
             root_ind,
             self.past_key_values,
@@ -449,7 +587,7 @@ class SdpaV2Backend(SubSpecV2Backend):
             dtype=torch.long,
             device=device,
         )
-        return self.gen._tree_decoding(
+        return self._tree_decoding(
             tree,
             self.past_key_values,
             position_offset=position_offset,
@@ -460,7 +598,7 @@ class SdpaV2Backend(SubSpecV2Backend):
 
     def reorder_tail(self, *, hidden_indices_cache, tree_size, root_ind, is_prev_accepted, finished, prune_tokens, disable_post_verify, input_len):
         if (not is_prev_accepted) or finished:
-            self.gen._reorder_pending_tree_cache(
+            self._reorder_pending_tree_cache(
                 self.past_key_values,
                 hidden_indices_cache,
                 int(tree_size),
@@ -473,6 +611,7 @@ class SdpaV2Backend(SubSpecV2Backend):
 
 # --------------------------------------------------------------------------- #
 # FlashInfer / paged adapter. Request-cache syncs + commit-seed; capacity-bounded.
+# Owns the FlashInfer KV-cache + attention methods (were on the FI generator).
 # --------------------------------------------------------------------------- #
 class FlashInferV2Backend(SubSpecV2Backend):
     method_name = "subspec_sd_v2_fi"
@@ -484,6 +623,348 @@ class FlashInferV2Backend(SubSpecV2Backend):
         self.max_cache_len = None
         self._prompt_len = 0
 
+    # ----- backend-specific methods (relocated from the FI generator) ----- #
+    def _build_rewrite_batch_position(self, request_kv_cache, *, num_tokens: int, device):
+        from ..utils.flashinfer.cache_manager import KvCacheBatchPosition
+
+        num_tokens = int(num_tokens)
+        if num_tokens <= 0:
+            raise ValueError(f"num_tokens must be positive for rewrite, got {num_tokens}")
+        seq_len = int(request_kv_cache.get_seq_length())
+        rewrite_start = int(seq_len) - int(num_tokens)
+        if rewrite_start < 0:
+            raise RuntimeError(
+                "Invalid FI rewrite window for post-verify: "
+                f"seq_len={seq_len}, num_tokens={num_tokens}, rewrite_start={rewrite_start}"
+            )
+
+        kv_page_indices = torch.tensor(
+            request_kv_cache.kv_page_indices,
+            dtype=torch.int32,
+            device=device,
+        )
+        kv_page_indptr = torch.tensor(
+            [0, int(kv_page_indices.numel())],
+            dtype=torch.int32,
+            device=device,
+        )
+        kv_last_page_len = torch.tensor(
+            [int(request_kv_cache.kv_last_page_len)],
+            dtype=torch.int32,
+            device=device,
+        )
+        seq_indptr = torch.tensor([0, int(num_tokens)], dtype=torch.int32, device=device)
+        batch_indices = torch.zeros((int(num_tokens),), dtype=torch.int32, device=device)
+        positions = torch.arange(
+            int(rewrite_start),
+            int(seq_len),
+            dtype=torch.int32,
+            device=device,
+        )
+
+        return KvCacheBatchPosition(
+            seq_indptr=seq_indptr,
+            kv_page_indptr=kv_page_indptr,
+            kv_page_indices=kv_page_indices,
+            kv_last_page_len=kv_last_page_len,
+            batch_indices=batch_indices,
+            positions=positions,
+        )
+
+    def _draft_tree_decoding(self, tree, request_kv_cache, position_offset, skip_nodes, device, *, append_tokens: bool = True):
+        from ..utils.flashinfer.cache_manager import getKvCacheBatchPosition
+
+        g = self.gen
+        kv_cache_pool = request_kv_cache.kvCachePool
+        tree_input_ids, tree_position_ids, tree_mask = g._prepare_tree_inputs_and_mask(
+            tree,
+            position_offset=position_offset,
+            device=device,
+            model_dtype=kv_cache_pool.cache_data[0].dtype,
+            non_blocking=True,
+            skip_nodes=skip_nodes,
+            invert=False,
+        )
+
+        num_tokens = int(tree_input_ids.shape[0])
+        if num_tokens == 0:
+            return None, 0
+
+        with nvtx.annotate("draft_forward", color="red"):
+            # For rewrite phases (post-verify), use overwrite semantics by
+            # writing into the trailing `[seq_len - num_tokens, seq_len)` window.
+            if append_tokens:
+                request_kv_cache.increment(num_tokens)
+                batch_position = getKvCacheBatchPosition(
+                    request_kv_caches=[request_kv_cache],
+                    mode="tree",
+                    device=device,
+                    treeTokens=num_tokens,
+                )
+            else:
+                batch_position = self._build_rewrite_batch_position(
+                    request_kv_cache,
+                    num_tokens=int(num_tokens),
+                    device=device,
+                )
+            g.flashinferWrapper.prepareAttention(
+                "tree",
+                batch_position,
+                kv_cache_pool.page_len,
+                "NONE",
+                kv_cache_pool.cache_data[0].dtype,
+                attention_mask=tree_mask,
+            )
+            logits = g.draft_model(
+                tree_input_ids.unsqueeze(0),
+                with_softmax=False,
+                past_key_values=None,
+                position_ids=tree_position_ids.unsqueeze(0),
+                use_cache=False,
+                kvCachePool=kv_cache_pool,
+                batch_position=batch_position,
+                mode="tree",
+                flashinferWrapper=g.flashinferWrapper,
+            )
+        return logits, int(num_tokens)
+
+    def _post_verify(self, tree, root_ind, request_kv_cache, position_offset, last_tree_depth, skip_nodes, logits_processor, device):
+        g = self.gen
+        debug_enabled = bool(
+            getattr(g, "step_trace_enabled", False)
+            and getattr(g, "step_trace_debug_verify", False)
+        )
+        debug_extra: dict = {}
+
+        verify_tokens_expected = max(0, int(tree.size()) - int(skip_nodes))
+        if int(verify_tokens_expected) <= 0:
+            if debug_enabled:
+                g._last_post_verify_debug = debug_extra
+            return tree, None
+
+        # Ensure synchronous post-verify refill mutates the live request cache,
+        # not an overlap-clone snapshot from the previous round.
+        g.draft_model.request_kv_cache = request_kv_cache
+        if debug_enabled:
+            debug_extra["post_verify_rewrite_req_len_before"] = int(
+                request_kv_cache.get_seq_length()
+            )
+        expected_window_end = int(position_offset) + int(tree.size())
+        # Post-verify should rewrite the existing suffix window, not append a
+        # second copy after it.
+        self._sync_request_cache_to_len(
+            request_kv_cache,
+            expected_len=int(expected_window_end),
+        )
+        req_len_after_sync = int(request_kv_cache.get_seq_length())
+        rewrite_start = int(req_len_after_sync) - int(verify_tokens_expected)
+        if rewrite_start < 0:
+            raise RuntimeError(
+                "Invalid FI post-verify rewrite start: "
+                f"req_len_after_sync={req_len_after_sync}, "
+                f"verify_tokens_expected={int(verify_tokens_expected)}, "
+                f"rewrite_start={int(rewrite_start)}"
+            )
+        if debug_enabled:
+            debug_extra["post_verify_rewrite_req_len_after_sync"] = int(req_len_after_sync)
+            debug_extra["post_verify_rewrite_window_start"] = int(rewrite_start)
+            debug_extra["post_verify_rewrite_window_end"] = int(req_len_after_sync - 1)
+        next_token_logits, decoded_tokens = self._draft_tree_decoding(
+            tree,
+            request_kv_cache,
+            position_offset=position_offset,
+            skip_nodes=skip_nodes,
+            device=device,
+            append_tokens=False,
+        )
+        if debug_enabled:
+            debug_extra["post_verify_rewrite_req_len_after_decode"] = int(
+                request_kv_cache.get_seq_length()
+            )
+        if next_token_logits is None:
+            if debug_enabled:
+                g._last_post_verify_debug = debug_extra
+            return tree, None
+        if int(decoded_tokens) != int(verify_tokens_expected):
+            raise RuntimeError(
+                "FI post-verify token count mismatch after rewrite: "
+                f"decoded_tokens={int(decoded_tokens)}, expected={int(verify_tokens_expected)}"
+            )
+        if int(next_token_logits.shape[1]) != int(decoded_tokens):
+            raise RuntimeError(
+                "FI post-verify draft logits length mismatch: "
+                f"logits_len={int(next_token_logits.shape[1])}, decoded_tokens={int(decoded_tokens)}"
+            )
+
+        _, _, (_, accept_len) = g._verify(
+            tree,
+            root_ind,
+            next_token_logits,
+            logits_processor,
+            False,
+            skip_nodes=skip_nodes,
+        )
+
+        accept_len = int(accept_len)
+        kept_old_indices = tree.prune_to_depth(int(last_tree_depth) + accept_len)
+        if debug_enabled:
+            debug_extra["post_verify_accept_len"] = int(accept_len)
+            debug_extra["post_verify_kept_old_len"] = int(kept_old_indices.numel())
+        # Post-verify prune changes the live tree window. Clamp request-cache
+        # metadata before postspec refill so rebuilt frontier positions match
+        # the pruned tree geometry.
+        self._sync_request_cache_to_len(
+            request_kv_cache,
+            expected_len=int(position_offset) + int(tree.size()),
+        )
+
+        refill_steps = max(0, int(g.draft_params.max_depth) - accept_len)
+        if refill_steps > 0:
+            with nvtx.annotate("postspec_refill", color="cyan"):
+                g.draft_model.init_postspec()
+                for _ in range(refill_steps):
+                    if not g.draft_model.postspec():
+                        break
+            tree = g.draft_model.update_tree_after_post()
+        if debug_enabled:
+            debug_extra["post_verify_tree_token_hash"] = int(
+                g._tree_token_hash(tree=tree, skip_nodes=0)
+            )
+            g._last_post_verify_debug = debug_extra
+
+        g.post_verify_count += 1
+        return tree, kept_old_indices
+
+    def _tree_decoding(self, tree, request_kv_cache, position_offset, skip_nodes, device):
+        g = self.gen
+        kv_cache_pool = request_kv_cache.kvCachePool
+        tree_input_ids, tree_position_ids, tree_mask = g._prepare_tree_inputs_and_mask(
+            tree,
+            position_offset=position_offset,
+            device=device,
+            model_dtype=kv_cache_pool.cache_data[0].dtype,
+            non_blocking=True,
+            skip_nodes=skip_nodes,
+            invert=False,
+        )
+
+        num_tokens = int(tree_input_ids.shape[0])
+        if num_tokens == 0:
+            return None
+        batch_position = self._build_rewrite_batch_position(
+            request_kv_cache,
+            num_tokens=int(num_tokens),
+            device=device,
+        )
+
+        with nvtx.annotate("target_forward", color="red"):
+            g.flashinferWrapper.prepareAttention(
+                "tree",
+                batch_position,
+                kv_cache_pool.page_len,
+                "NONE",
+                kv_cache_pool.cache_data[0].dtype,
+                attention_mask=tree_mask,
+            )
+            outputs = g.target_model(
+                input_ids=tree_input_ids.unsqueeze(0),
+                past_key_values=None,
+                position_ids=tree_position_ids.unsqueeze(0),
+                output_hidden_states=True,
+                use_cache=False,
+                kvCachePool=kv_cache_pool,
+                batch_position=batch_position,
+                mode="tree",
+                flashinferWrapper=g.flashinferWrapper,
+            )
+        return outputs
+
+    def _reorder_pending_tree_cache(self, request_kv_cache, hidden_indices, pending_tree_size: int) -> None:
+        g = self.gen
+        if hidden_indices is None or int(hidden_indices.numel()) <= 0:
+            raise RuntimeError(
+                "Deferred reorder expected non-empty hidden_indices_cache in subspec_sd_v2_fi."
+            )
+
+        pending_tree_size = g._resolve_pending_chunk_size(
+            hidden_indices,
+            int(pending_tree_size),
+        )
+        max_hidden_idx = int(hidden_indices.max().item())
+        if max_hidden_idx >= int(pending_tree_size):
+            raise RuntimeError(
+                "Invalid deferred-reorder indices in subspec_sd_v2_fi: "
+                f"max_hidden_idx={max_hidden_idx}, pending_tree_size={int(pending_tree_size)}"
+            )
+
+        seq_len = int(request_kv_cache.get_seq_length())
+        base_offset = int(seq_len) - int(pending_tree_size) + 1
+        if base_offset <= 0:
+            raise RuntimeError(
+                "Invalid deferred-reorder offset in subspec_sd_v2_fi: "
+                f"seq_len={seq_len}, pending_tree_size={int(pending_tree_size)}, "
+                f"computed_offset={base_offset}"
+            )
+
+        request_kv_cache.reorder_cache_with_offset(
+            hidden_indices,
+            offset=base_offset,
+            num_new_tokens=int(pending_tree_size),
+        )
+
+    def _flush_deferred_tree_cache(self, request_kv_cache, hidden_indices_cache, tree_size: int):
+        with nvtx.annotate("kv_reorder"):
+            self._reorder_pending_tree_cache(
+                request_kv_cache,
+                hidden_indices_cache,
+                int(tree_size),
+            )
+        return 0, False, None
+
+    def _sync_request_cache_to_len(self, request_kv_cache, *, expected_len: int) -> None:
+        g = self.gen
+        expected_len = int(expected_len)
+        cache_capacity = g._request_cache_capacity(request_kv_cache)
+        if cache_capacity is not None:
+            expected_len = min(int(expected_len), int(cache_capacity))
+        current_len = int(request_kv_cache.get_seq_length())
+        if current_len > expected_len:
+            request_kv_cache.decrement(int(current_len - expected_len))
+            return
+        if current_len < expected_len:
+            # Budget-capped rounds can carry a tree whose full window was not
+            # materialized in the request cache metadata yet; grow to target.
+            request_kv_cache.increment(int(expected_len - current_len))
+
+    def _sync_request_cache_to_tree(self, request_kv_cache, *, position_offset: int, tree_size: int) -> None:
+        """Clamp request metadata to the current `[prefix + tree]` footprint."""
+        self._sync_request_cache_to_len(
+            request_kv_cache,
+            expected_len=int(position_offset) + int(tree_size),
+        )
+
+    def _commit_seed_postspec_before_post_verify(self, *, tree, request_kv_cache, position_offset: int):
+        g = self.gen
+        # Commit-seed one deterministic postspec step from the current
+        # committed `[prefix + tree]` boundary before carry-over post-verify.
+        self._sync_request_cache_to_tree(
+            request_kv_cache,
+            position_offset=int(position_offset),
+            tree_size=int(tree.size()),
+        )
+        g.draft_model.request_kv_cache = request_kv_cache
+        g.draft_model.init_postspec(rebuild_frontier=True)
+        with nvtx.annotate("postspec_commit_seed", color="cyan"):
+            g.draft_model.postspec()
+        tree = g.draft_model.update_tree_after_post()
+        self._sync_request_cache_to_tree(
+            request_kv_cache,
+            position_offset=int(position_offset),
+            tree_size=int(tree.size()),
+        )
+        return tree
+
+    # ----- SubSpecV2Backend hooks ----- #
     def begin(self, input_ids, past_key_values):
         from ..utils.flashinfer.cache_manager import RequestKvCache
         from ..utils.flashinfer.attention_wrapper import FlashinferAttentionWrapper
@@ -537,10 +1018,15 @@ class FlashInferV2Backend(SubSpecV2Backend):
         setattr(g, "_fi_v2_request_reuse_len", int(self._prompt_len))
 
     def speculate(self, last_token_id):
-        return self.gen._speculate(last_token_id, self.request_kv_cache)
+        g = self.gen
+        return g.draft_model.speculate(
+            last_token_id,
+            request_kv_cache=self.request_kv_cache,
+            flashinferWrapper=g.flashinferWrapper,
+        )
 
     def sync_to_tree(self, *, position_offset, tree_size):
-        self.gen._sync_request_cache_to_tree(
+        self._sync_request_cache_to_tree(
             self.request_kv_cache,
             position_offset=int(position_offset),
             tree_size=int(tree_size),
@@ -550,21 +1036,21 @@ class FlashInferV2Backend(SubSpecV2Backend):
         return self.gen._request_cache_capacity(self.request_kv_cache)
 
     def flush_deferred(self, hidden_indices_cache, tree_size, *, input_len):
-        return self.gen._flush_deferred_tree_cache(
+        return self._flush_deferred_tree_cache(
             self.request_kv_cache,
             hidden_indices_cache,
             int(tree_size),
         )
 
     def commit_seed(self, tree, *, position_offset):
-        return self.gen._commit_seed_postspec_before_post_verify(
+        return self._commit_seed_postspec_before_post_verify(
             tree=tree,
             request_kv_cache=self.request_kv_cache,
             position_offset=int(position_offset),
         )
 
     def post_verify(self, tree, root_ind, *, position_offset, skip_nodes, last_tree_depth, logits_processor, device):
-        return self.gen._post_verify(
+        return self._post_verify(
             tree,
             int(root_ind),
             self.request_kv_cache,
@@ -584,13 +1070,12 @@ class FlashInferV2Backend(SubSpecV2Backend):
         return int(decoded_tree_size)
 
     def tree_forward(self, tree, *, position_offset, skip_nodes, decoded_tree_size, device):
-        g = self.gen
-        g._sync_request_cache_to_tree(
+        self._sync_request_cache_to_tree(
             self.request_kv_cache,
             position_offset=int(position_offset),
             tree_size=int(tree.size()),
         )
-        outputs = g._tree_decoding(
+        outputs = self._tree_decoding(
             tree,
             self.request_kv_cache,
             position_offset=int(position_offset),
@@ -609,13 +1094,13 @@ class FlashInferV2Backend(SubSpecV2Backend):
 
     def reorder_tail(self, *, hidden_indices_cache, tree_size, root_ind, is_prev_accepted, finished, prune_tokens, disable_post_verify, input_len):
         if disable_post_verify and bool(is_prev_accepted) and (not bool(finished)):
-            return self.gen._flush_deferred_tree_cache(
+            return self._flush_deferred_tree_cache(
                 self.request_kv_cache,
                 hidden_indices_cache,
                 int(tree_size),
             )
         elif (not is_prev_accepted) or finished:
-            self.gen._reorder_pending_tree_cache(
+            self._reorder_pending_tree_cache(
                 self.request_kv_cache,
                 hidden_indices_cache,
                 int(tree_size),
