@@ -500,7 +500,9 @@ class SdpaV2Backend(SubSpecV2Backend):
         )
         past_key_values.seq_len += hidden_indices.shape[0]
 
-    def _flush_deferred_tree_cache(self, past_key_values, hidden_indices_cache, tree_size: int, *, input_len: int):
+    def _flush_deferred_tree_cache(
+        self, past_key_values, hidden_indices_cache, tree_size: int, *, input_len: int
+    ) -> tuple[int, bool, torch.Tensor | None]:
         with nvtx.annotate("kv_reorder"):
             self._reorder_pending_tree_cache(
                 past_key_values,
@@ -912,7 +914,9 @@ class FlashInferV2Backend(SubSpecV2Backend):
             num_new_tokens=int(pending_tree_size),
         )
 
-    def _flush_deferred_tree_cache(self, request_kv_cache, hidden_indices_cache, tree_size: int):
+    def _flush_deferred_tree_cache(
+        self, request_kv_cache, hidden_indices_cache, tree_size: int
+    ) -> tuple[int, bool, torch.Tensor | None]:
         with nvtx.annotate("kv_reorder"):
             self._reorder_pending_tree_cache(
                 request_kv_cache,
