@@ -28,16 +28,6 @@ class SubSpecSDGeneratorBase(FlashInferCacheMixin, ClassicSDGeneratorBase):
         "flashinfer": FlashInferV2Backend,
     }
 
-    def init_cuda_graph_runner(self, device, kvCachePool=None):
-        """Initialize the draft model's CUDA-graph runner (FlashInfer path only).
-
-        A no-op on SDPA: the SDPA draft model does not expose this hook.
-        """
-        if hasattr(self.draft_model, "init_cuda_graph_runner") and callable(
-            self.draft_model.init_cuda_graph_runner
-        ):
-            self.draft_model.init_cuda_graph_runner(device=device)
-
     def _generate(
         self,
         input_ids: torch.LongTensor,

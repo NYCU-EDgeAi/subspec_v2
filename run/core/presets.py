@@ -141,7 +141,16 @@ def register_presets():
             "llm_path": "meta-llama/Llama-3.1-8B-Instruct",
             "draft_model_path": "meta-llama/Llama-3.2-1B-Instruct",
             "recipe": None,
-        }
+        },
+        # `backend: flashinfer` swaps in the paged draft model + FlashInfer loaders;
+        # same generator/loop, chosen by the ClassicBackend adapter.
+        backends={
+            "flashinfer": {
+                "draft_model_cls": "specdecodes.models.draft_models.classic_sd_fi:ClassicSDDraftModel",
+                "load_draft_model_fn": flashinfer_load_draft_model,
+                "load_kv_cache_fn": flashinfer_load_kv_cache,
+            },
+        },
     )
     
     # Vanilla (Naive)
@@ -187,24 +196,9 @@ def register_presets():
     except ImportError:
         pass
 
-    # Classic SD FlashInfer (lazy import)
-    ModelRegistry.register(
-        name="classic_sd_fi",
-        generator_cls="specdecodes.models.generators.classic_sd_fi:ClassicSDGenerator",
-        draft_model_cls="specdecodes.models.draft_models.classic_sd_fi:ClassicSDDraftModel",
-        default_config={
-            "llm_path": "meta-llama/Llama-3.1-8B-Instruct",
-            "draft_model_path": "meta-llama/Llama-3.2-1B-Instruct",
-            "recipe": None,
-            "backend": "flashinfer",
-        },
-        load_draft_model_fn=flashinfer_load_draft_model,
-        load_kv_cache_fn=flashinfer_load_kv_cache,
-    )
-
-    # NOTE: the SubSpec v1/v2 FlashInfer variants are no longer separate methods; they
-    # are `method: subspec_sd[_v2]` + `backend: flashinfer` (see the `backends=` override
-    # on those entries above). Only the classic FlashInfer twin remains standalone.
+    # NOTE: the classic and SubSpec v1/v2 FlashInfer variants are no longer separate
+    # methods; they are `method: classic_sd | subspec_sd | subspec_sd_v2` +
+    # `backend: flashinfer` (see the `backends=` override on those entries above).
 
     # Classic SD Seq
     try:

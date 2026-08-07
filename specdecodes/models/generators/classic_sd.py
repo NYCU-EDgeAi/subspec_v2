@@ -5,6 +5,12 @@ import logging
 import nvtx
 
 from .base import GeneratorBase
+from .flashinfer_cache_mixin import FlashInferCacheMixin
+from .classic_sd_loop import (
+    run_classic_generate,
+    SdpaClassicBackend,
+    FlashInferClassicBackend,
+)
 from ..utils.mixin import SDProfilingMixin
 from ..utils.utils import invert_mask
 from ..utils.tree_verify import verify_tree
@@ -283,6 +289,22 @@ class ClassicSDGeneratorBase(GeneratorBase):
             verify_kwargs=verify_kwargs,
         )
 
+    #: backend name -> ClassicBackend adapter class.
+    _CLASSIC_BACKENDS = {
+        "sdpa": SdpaClassicBackend,
+        "flashinfer": FlashInferClassicBackend,
+    }
+
+    def init_cuda_graph_runner(self, device, kvCachePool=None):
+        """Initialize the draft model's CUDA-graph runner (FlashInfer path only).
+
+        A no-op on SDPA: the SDPA draft model does not expose this hook.
+        """
+        if hasattr(self.draft_model, "init_cuda_graph_runner") and callable(
+            self.draft_model.init_cuda_graph_runner
+        ):
+            self.draft_model.init_cuda_graph_runner(device=device)
+
     def _generate(
         self,
         input_ids: torch.LongTensor,
@@ -291,153 +313,28 @@ class ClassicSDGeneratorBase(GeneratorBase):
         do_sample: bool,
         **model_kwargs,
     ):
-        """Generate a token sequence with speculative decoding.
+        """Generate a token sequence with classic speculative decoding.
 
-        Stages:
-        - Prefill: run the target model on the prompt, then sample the next token.
-        - Decode loop:
-            1) Draft proposes candidate tokens (tree form).
-            2) Target scores candidates in one forward.
-            3) Verify and accept a prefix, then update KV/state.
-
-        Args:
-            input_ids (torch.LongTensor): The input token IDs.
-            stopping_criteria (StoppingCriteria): The criteria to stop the generation.
-            logits_processor (LogitsProcessor): The processor to modify the logits.
-            do_sample (bool): Whether to sample tokens during generation. If False, the generation will be deterministic.
-
-        Returns:
-            input_ids (torch.LongTensor): The generated token IDs.
+        The decode loop is shared across attention backends; see
+        `classic_sd_loop.run_classic_generate`. The `backend:` config field
+        (`self.backend`) selects the `ClassicBackend` adapter.
         """
-        assert self.target_model is not None, "target_model must be provided"
-        assert self.draft_model is not None, "draft_model must be provided"
-        assert self.tokenizer is not None, "tokenizer must be provided"
-
-        input_ids = input_ids.clone()
-        batch_size, _ = input_ids.shape
-        assert batch_size == 1, "Only support batch_size=1 for now."
-
-        # Raise error if max_length not set while using static cache
-        if stopping_criteria.max_length is None:
-            if self.cache_implementation == "static":
-                raise ValueError(
-                    "max_length is not set. Only 'dynamic' kv-cache is supported when max_length is unspecified."
-                )
-            
-        if model_kwargs.get("past_key_values") is not None:
-            past_key_values = model_kwargs["past_key_values"]
-            max_cache_len = getattr(past_key_values.cache, "max_cache_len", None)
-
-            if model_kwargs.get("draft_past_key_values") is not None:
-                draft_past_key_values = model_kwargs["draft_past_key_values"]
-                self.draft_model.set_past_key_values(draft_past_key_values)
-        else:
-            raise ValueError("past_key_values and draft_past_key_values should both be provided")
-
-        stream_callback = model_kwargs.get("stream_callback", None)
-        
-        with nvtx.annotate("prefill_chunked", color="orange"):
-            self._init_tree_mask(
-                self.draft_params.max_verify_tokens, max_cache_len, device=input_ids.device
+        backend_cls = self._CLASSIC_BACKENDS.get(str(self.backend))
+        if backend_cls is None:
+            raise ValueError(
+                f"Unknown backend {self.backend!r} for classic_sd; "
+                f"expected one of {sorted(self._CLASSIC_BACKENDS)}."
             )
-            outputs = self._chunked_prefill_forward(
-                input_ids,
-                past_key_values,
-                prefill_chunk_size=self.prefill_chunk_size,
-                use_position_ids=True,
-            )
-            next_token_logits = outputs.logits
-            del outputs
-
-        remaining = self._remaining_token_budget(input_ids, stopping_criteria)
-        if remaining is not None and int(remaining) <= 0:
-            return input_ids
-
-        with nvtx.annotate("sample"):
-            sampled_tokens = self._sample_token(next_token_logits, logits_processor, do_sample)
-
-        with nvtx.annotate("state_update"):
-            input_ids = torch.cat([input_ids, sampled_tokens], dim=-1)
-            self._maybe_stream(stream_callback, sampled_tokens)
-
-        with nvtx.annotate("decode_loop"):
-            finished = False
-            while not finished:
-                remaining = self._remaining_token_budget(input_ids, stopping_criteria)
-                if remaining is not None and int(remaining) <= 0:
-                    break
-
-                with nvtx.annotate("speculate", color="cyan"):
-                    input_ids = input_ids.clone(memory_format=torch.contiguous_format)
-                    tree = self._speculate(input_ids)
-                    decoded_tree_size = self._cap_tree_to_budget(
-                        tree,
-                        input_ids,
-                        stopping_criteria,
-                    )
-                    if decoded_tree_size <= 0:
-                        break
-                    if self.cache_implementation == "dynamic":
-                        _, input_len = input_ids.shape
-                        draft_past_key_values.crop(input_len)
-
-                with nvtx.annotate("target_decode", color="orange"):
-                    prev_kv_len = past_key_values.get_seq_length()
-                    position_offset = int(input_ids.shape[1]) - 1
-                    cache_position = torch.arange(
-                        position_offset,
-                        position_offset + int(decoded_tree_size),
-                        dtype=torch.long,
-                        device=input_ids.device,
-                    )
-                    outputs = self._tree_decoding(
-                        tree,
-                        past_key_values,
-                        position_offset=position_offset,
-                        cache_position=cache_position,
-                        device=input_ids.device,
-                    )
-                    next_token_logits = outputs.logits
-                    del outputs
-
-                with nvtx.annotate("verify"):
-                    root_ind = 0
-                    sampled_tokens, hidden_indices, _ = self._verify(
-                        tree,
-                        root_ind,
-                        next_token_logits,
-                        logits_processor,
-                        do_sample,
-                    )
-                    
-                    sampled_tokens = sampled_tokens.to(input_ids.device)
-                    del next_token_logits
-
-                with nvtx.annotate("state_update"):
-                    input_ids = torch.cat([input_ids, sampled_tokens], dim=-1)
-
-                with nvtx.annotate("stop_check"):
-                    finished, input_ids, kept, prune_tokens = self._apply_tokenwise_stopping_criteria(
-                        input_ids=input_ids,
-                        sampled_tokens=sampled_tokens,
-                        stopping_criteria=stopping_criteria,
-                    )
-                if kept.numel() > 0:
-                    self._maybe_stream(stream_callback, kept)
-                                
-                with nvtx.annotate("kv_reorder"):
-                    past_key_values.reorder_cache_with_offset(
-                        hidden_indices,
-                        offset=prev_kv_len,
-                        new_chunk_len=int(decoded_tree_size),
-                        dim=2,
-                    )
-                    past_key_values.seq_len += hidden_indices.shape[0]
-                    if finished:
-                        past_key_values.seq_len -= prune_tokens
-
-        return input_ids
+        return run_classic_generate(
+            self,
+            backend_cls(self),
+            input_ids,
+            stopping_criteria,
+            logits_processor,
+            do_sample,
+            **model_kwargs,
+        )
 
 
-class ClassicSDGenerator(SDProfilingMixin, ClassicSDGeneratorBase):
+class ClassicSDGenerator(SDProfilingMixin, FlashInferCacheMixin, ClassicSDGeneratorBase):
     pass

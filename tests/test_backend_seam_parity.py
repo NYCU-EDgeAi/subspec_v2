@@ -53,6 +53,9 @@ GOLDENS = {
     ("subspec_sd", "flashinfer"):    list(_PARIS),   # (v1 FI, fixed)
     ("subspec_sd_v2", "sdpa"):       list(_PARIS),
     ("subspec_sd_v2", "flashinfer"): list(_PARIS),
+    # Classic SD is exact -> both backends equal plain greedy (verified vs `vanilla`).
+    ("classic_sd", "sdpa"):          list(_PARIS),
+    ("classic_sd", "flashinfer"):    list(_PARIS),
 }
 
 
@@ -87,7 +90,13 @@ def _greedy_new_ids(method: str, backend: str, *, llm_path: str, prompt: str, n_
     cfg.do_sample = False
     cfg.temperature = 0.0
     cfg.generator_profiling = False
-    cfg.draft_params = DraftParams(temperature=0.2, max_depth=32, topk_len=6)
+    # Classic FlashInfer's paged reorder cache is sized for a smaller tree; a depth-32
+    # tree overflows it ("need to allocate new pages"). Classic SD is exact, so the
+    # greedy output is identical at any tree size — use a depth that fits the paging.
+    if method.startswith("classic_sd"):
+        cfg.draft_params = DraftParams(temperature=0.2, max_depth=16, topk_len=4)
+    else:
+        cfg.draft_params = DraftParams(temperature=0.2, max_depth=32, topk_len=6)
     cfg.generator_kwargs = {"prefill_chunk_size": 256, "verify_method": "exact", "verify_kwargs": {}}
 
     generator, tokenizer, past_kv, draft_past_kv = GeneratorPipelineBuilder(cfg).build()
