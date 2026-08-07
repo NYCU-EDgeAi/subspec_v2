@@ -45,9 +45,15 @@ class ClassicBackend(ABC):
     def speculate(self, input_ids: torch.LongTensor) -> Any:
         """Run the draft model to propose a candidate tree."""
 
-    def after_cap(self, tree_size_before: int, tree_size_after: int, input_ids: torch.LongTensor) -> None:
+    def after_cap(
+        self, tree_size_before: int, tree_size_after: int, input_ids: torch.LongTensor, decoded_tree_size: int
+    ) -> None:
         """Reconcile the draft cache with the budget-capped tree (FlashInfer syncs
-        request metadata; SDPA crops the dynamic draft cache)."""
+        request metadata; SDPA crops the dynamic draft cache).
+
+        Runs *before* the ``decoded_tree_size <= 0`` break so FlashInfer always syncs
+        (as the original FI loop did); ``decoded_tree_size`` lets SDPA reproduce its
+        original crop-only-when-proceeding behavior."""
         return None
 
     @abstractmethod
@@ -136,9 +142,17 @@ def run_classic_generate(
                     stopping_criteria,
                 )
                 tree_size_after_cap = int(tree.size())
+                # Reconcile the draft cache before the break: the FI backend must roll
+                # back its speculative increment even on a cap-to-zero terminal round
+                # (matching the pre-seam loop); SDPA crops only when proceeding.
+                backend.after_cap(
+                    tree_size_before_cap,
+                    tree_size_after_cap,
+                    input_ids,
+                    decoded_tree_size=int(decoded_tree_size),
+                )
                 if decoded_tree_size <= 0:
                     break
-                backend.after_cap(tree_size_before_cap, tree_size_after_cap, input_ids)
 
             with nvtx.annotate("target_decode", color="orange"):
                 prev_kv_len = backend.current_kv_len()
@@ -220,8 +234,10 @@ class SdpaClassicBackend(ClassicBackend):
         contiguous_input_ids = input_ids.clone(memory_format=torch.contiguous_format)
         return self.gen._speculate(contiguous_input_ids)
 
-    def after_cap(self, tree_size_before, tree_size_after, input_ids):
-        if self.gen.cache_implementation == "dynamic":
+    def after_cap(self, tree_size_before, tree_size_after, input_ids, decoded_tree_size):
+        # Original SDPA loop cropped the dynamic draft cache only *after* passing the
+        # `decoded_tree_size <= 0` break, i.e. only when the round proceeds.
+        if int(decoded_tree_size) > 0 and self.gen.cache_implementation == "dynamic":
             self.draft_past_key_values.crop(int(input_ids.shape[1]))
 
     def current_kv_len(self):
@@ -398,7 +414,9 @@ class FlashInferClassicBackend(ClassicBackend):
             flashinferWrapper=g.flashinferWrapper,
         )
 
-    def after_cap(self, tree_size_before, tree_size_after, input_ids):
+    def after_cap(self, tree_size_before, tree_size_after, input_ids, decoded_tree_size):
+        # Original FI loop synced (rolling back the speculative draft increment) before
+        # the `decoded_tree_size <= 0` break, so this runs unconditionally.
         self.gen._sync_request_cache_after_tree_truncation(
             self.draft_request_kv_cache,
             tree_size_before=int(tree_size_before),
