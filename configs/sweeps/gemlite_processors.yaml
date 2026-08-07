@@ -1,0 +1,13 @@
+# PROTOTYPE demo sweep — collapses the 5 gemlite_* configs into ONE base + a processor axis.
+# `recipe.kwargs.processor` lives in a YAML recipe block, so the override merges cleanly.
+# Recipe changes model construction, so each point is a FULL rebuild.
+base: configs/methods/subspec_sd_gemlite_nvfp4.yaml
+run: run-benchmark
+
+axes:
+  recipe.kwargs.processor:
+    - A4W4_NVFP_dynamic
+    - A8W8_FP8_dynamic
+    - A8W8_INT8_dynamic
+    - A4W4_MXFP_dynamic
+    - A8W4_MXFP_dynamic

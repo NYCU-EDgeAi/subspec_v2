@@ -1,0 +1,12 @@
+# PROTOTYPE demo sweep — generator-level cartesian sweep.
+# Only draft_params/temperature vary, so every point is a CHEAP pipeline rebuild:
+# the resident target/draft weights are reused (à la run_grid_search), no reload.
+base: configs/methods/subspec_sd.yaml
+run: run-benchmark               # inner action per point
+
+set:                             # fixed overrides applied to every point (like --set)
+  max_length: 512
+
+axes:                            # cartesian product -> 3 x 2 = 6 points
+  draft_params.max_depth: [8, 16, 32]
+  temperature: [0.0, 0.2]

@@ -1,0 +1,17 @@
+# PROTOTYPE demo sweep — collapses the exp_offloading matrix (16 files) into one base +
+# correlated model bundles + an optional generator axis.
+#
+# `include` holds bundles of overrides that must travel TOGETHER (a model and its vram /
+# offload knob are correlated — you can't cartesian-product them independently, or you'd get
+# a 7B model with a 32B vram budget). `axes` still cartesian-products on top. Total points =
+# len(include) x prod(len(axis)). Model-touching bundles -> FULL rebuild per point.
+base: configs/methods/subspec_sd.yaml
+run: run-benchmark
+
+include:
+  - {llm_path: Qwen/Qwen2.5-7B-Instruct,  vram_limit_gb: 8,  recipe.kwargs.keep_first_n_layers_on_gpu: 11}
+  - {llm_path: Qwen/Qwen2.5-14B-Instruct, vram_limit_gb: 12, recipe.kwargs.keep_first_n_layers_on_gpu: 15}
+  - {llm_path: Qwen/Qwen2.5-32B-Instruct, vram_limit_gb: 24, recipe.kwargs.keep_first_n_layers_on_gpu: 20}
+
+axes:
+  draft_params.max_depth: [16, 32]     # 3 bundles x 2 depths = 6 points

@@ -49,7 +49,22 @@ def run_app(builder):
             window_size_values=w,
             max_samples=max_samples,
         )
-        
+
+    @app.command()
+    def run_sweep(
+        spec: str = typer.Option(..., help="Path to a sweep YAML (base/run/set/axes/include)."),
+        max_samples: int = typer.Option(None, help="Cap benchmark samples per point."),
+    ):
+        """Run a declared experiment sweep: one base config x axes/include override points.
+
+        Usage:
+            python -m run.main --config configs/methods/subspec_sd.yaml \\
+                run-sweep --spec configs/sweeps/depth_temp.yaml --max-samples 5
+        """
+        from run.pipelines.run_sweep import main as main_run_sweep
+
+        main_run_sweep(builder, spec_path=spec, max_samples=max_samples)
+
     @app.command()
     def run_benchmark(
         benchmarks: str = None,
