@@ -67,6 +67,42 @@ def _deep_merge_dict(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str
     return out
 
 
+def _parse_set_overrides(pairs) -> Dict[str, Any]:
+    """Parse repeated ``--set key.path=value`` flags into one nested dict.
+
+    The value is parsed as a YAML scalar so `16`->int, `1e-3`->float, `true`->bool,
+    `null`->None, `[a,b]`->list; anything else stays a string. Dotted keys nest, e.g.
+    ``draft_params.max_depth=8`` -> ``{"draft_params": {"max_depth": 8}}``. The result is
+    deep-merged over the YAML config, so it flows through the normal draft_params /
+    generator_kwargs handling. (Merging into a `recipe:` the method preset supplies as an
+    object won't work; specify `recipe:` as a YAML block to override its kwargs.)
+    """
+    import yaml
+
+    result: Dict[str, Any] = {}
+    for item in pairs or []:
+        if "=" not in item:
+            raise ValueError(f"--set expects KEY.PATH=VALUE, got {item!r}")
+        key_path, _, raw = item.partition("=")
+        key_path = key_path.strip()
+        if not key_path:
+            raise ValueError(f"--set has an empty key in {item!r}")
+        try:
+            value = yaml.safe_load(raw)
+        except Exception:
+            value = raw
+        node = result
+        parts = key_path.split(".")
+        for part in parts[:-1]:
+            child = node.get(part)
+            if not isinstance(child, dict):
+                child = {}
+                node[part] = child
+            node = child
+        node[parts[-1]] = value
+    return result
+
+
 def _draft_params_to_dict(dp) -> Dict[str, Any]:
     if dp is None:
         return {}
@@ -256,6 +292,20 @@ def _build_base_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=None,
         help="Enable/disable detailed analysis logging (overrides YAML)",
+    )
+    parser.add_argument(
+        "--set",
+        dest="set_overrides",
+        action="append",
+        default=None,
+        metavar="KEY.PATH=VALUE",
+        help=(
+            "Override any config field, dotted for nesting; repeatable. Value is parsed "
+            "as YAML (16 -> int, true -> bool, [a,b] -> list). Reaches nested config the "
+            "named flags can't, e.g. --set draft_params.max_depth=8 "
+            "--set generator_kwargs.verify_kwargs.threshold=0.3. Precedence: named flag "
+            "> --set > YAML > method default."
+        ),
     )
     return parser
 
@@ -520,6 +570,16 @@ def main():
     args, _ = base_parser.parse_known_args()
     config_path, yaml_config, method = _load_yaml_and_method(args)
 
+    # Fold `--set key.path=value` overrides in above the YAML (below named flags), so they
+    # flow through the normal draft_params/generator_kwargs handling and reach any field.
+    try:
+        set_overrides = _parse_set_overrides(getattr(args, "set_overrides", None))
+    except ValueError as e:
+        print(f"Error: {e}")
+        sys.exit(2)
+    if set_overrides:
+        yaml_config = _deep_merge_dict(yaml_config, set_overrides)
+
     # If enabled via YAML/CLI, re-exec under Nsight Systems *before* importing heavy GPU code.
     nsys_enabled, nsys_output = _effective_nsys_settings(args, yaml_config)
     _maybe_reexec_with_nsys(nsys_enabled, nsys_output)
@@ -556,13 +616,17 @@ def main():
     # (Kept for backward compatibility + explicit error messaging if this file is reused elsewhere.)
     _enforce_benchmark_requires_config(typer_argv, args.config)
     
-    # 5) Build AppConfig
-    config = _build_app_config(
-        AppConfig=AppConfig,
-        method=method,
-        default_config=default_config,
-        config_args=config_args,
-    )
+    # 5) Build AppConfig (unknown keys from YAML / --set raise here)
+    try:
+        config = _build_app_config(
+            AppConfig=AppConfig,
+            method=method,
+            default_config=default_config,
+            config_args=config_args,
+        )
+    except ValueError as e:
+        print(f"Error: {e}")
+        sys.exit(2)
     _configure_wandb_flags(config)
 
     # Allow YAML to specify recipes via import path + kwargs.

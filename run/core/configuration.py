@@ -1,4 +1,5 @@
-from dataclasses import dataclass, field
+import difflib
+from dataclasses import dataclass, field, fields
 from typing import Optional, Dict, Any, Union
 import torch
 from specdecodes.models.utils.utils import DraftParams
@@ -58,6 +59,23 @@ class AppConfig:
     nsys_output: str = "nsight_report"
 
     def update(self, new_config: Dict[str, Any]):
+        """Set config fields from a dict, rejecting unknown keys.
+
+        Previously unknown keys were silently dropped, so a typo like `max_lenght`
+        or `draft_parms` became a no-op that quietly ran the default. Now they raise
+        with a did-you-mean hint (every field a config may set is an AppConfig field;
+        `extends` is consumed earlier at the YAML layer)."""
+        known = {f.name for f in fields(self)}
+        unknown = [k for k in new_config if k not in known]
+        if unknown:
+            hints = []
+            for k in unknown:
+                near = difflib.get_close_matches(str(k), known, n=1)
+                hints.append(repr(k) + (f" (did you mean {near[0]!r}?)" if near else ""))
+            raise ValueError(
+                "Unknown config key(s): "
+                + ", ".join(hints)
+                + f".\nKnown keys: {', '.join(sorted(known))}."
+            )
         for key, value in new_config.items():
-            if hasattr(self, key):
-                setattr(self, key, value)
+            setattr(self, key, value)
