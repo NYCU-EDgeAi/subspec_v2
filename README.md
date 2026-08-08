@@ -14,7 +14,6 @@ This repository is the official implementation of *"Speculate Deep and Accurate:
 	- [Available Methods](#available-methods)
 	- [Common Arguments](#common-arguments)
 - [Evaluation](#evaluation)
-	- [Examples](#examples)
 - [Results](#results)
 - [Interfaces](#interfaces)
 	- [Gradio Demo](#gradio-demo)
@@ -72,10 +71,10 @@ All entrypoints go through `run.main` by setting a YAML config (`--config`).
 
 ### YAML configs (recommended)
 
-- Method templates: `configs/methods/`
-- Migrated offloading experiment configs: `configs/exp_offloading/`
+- Method templates: `configs/methods/` (near-identical variants share a base via `extends:`).
+- Offloading experiment configs: `configs/exp_offloading/`
 
-Precedence: method defaults < YAML < CLI.
+Precedence: method defaults < YAML < `--set`.
 
 ```bash
 # Run from a method YAML
@@ -84,8 +83,15 @@ python -m run.main --config configs/methods/classic_sd.yaml run-test
 # Run from an exp_offloading YAML (includes a recipe + per-model offload settings)
 python -m run.main --config configs/exp_offloading/vanilla_qwen_7b.yaml run-test
 
-# Override any config field from the CLI with --set key.path=value (repeatable, nested-aware)
+# Override any config field with --set key.path=value (repeatable, nested-aware)
 python -m run.main --config configs/methods/classic_sd.yaml --set device=cuda:1 --set warmup_iter=0 run-test
+```
+
+The attention backend is the `backend:` field: `sdpa` (default) or `flashinfer` (paged
+KV cache). It applies to `classic_sd`, `subspec_sd`, and `subspec_sd_v2`:
+
+```bash
+python -m run.main --config configs/methods/subspec_sd_v2.yaml --set backend=flashinfer run-test
 ```
 
 Verification is configured via `generator_kwargs.verify_method` and `generator_kwargs.verify_kwargs`.
@@ -96,8 +102,8 @@ Example (lossy tree verification). `threshold_method` selects the gate: `entropy
 generator_kwargs:
   verify_method: lossy
   verify_kwargs:
-		threshold_method: entropy
-		threshold: 0.3
+    threshold_method: entropy
+    threshold: 0.3
     window_size: 6
 ```
 
@@ -142,15 +148,16 @@ detailed_analysis: true
 ```
 
 When enabled, extra per-step diagnostic data is stored in the JSONL output via `wandb_logger.log_data["detailed_analysis"]`.
-```
 
 ### Available Methods
-The following methods are available (registered in `run/core/presets.py`):
+Set with `method:` (in YAML) or `--method`. The full list is in `run/core/presets.py`; the main ones:
 - `subspec_sd`: Substitute Speculative Decoding (Offloading + HQQ Quantization)
+- `subspec_sd_v2`: SubSpec with post-verify overlap
 - `classic_sd`: Standard Speculative Decoding
-- `vanilla`: Base LLM inference (no speculative decoding)
 - `eagle_sd`: EAGLE Speculative Decoding
-- ...and others (`subspec_sd_v2`, `subspec_sd_no_offload`, etc.)
+- `vanilla`: Base LLM inference (no speculative decoding)
+
+Pair any of these with `--set backend=flashinfer` for the FlashInfer backend.
 
 ### Common Arguments
 - `--config`: Path to a YAML config (required).
@@ -165,98 +172,35 @@ The following methods are available (registered in `run/core/presets.py`):
 
 ## Evaluation
 
-Investigation notes:
-
-- `docs/subspec_sd_v2_fi_acceptance_root_cause.md`: root-cause, follow-up benchmark snapshot, and next-session plan for `subspec_sd_v2_fi`.
-
 ```bash
-# Quick sanity check
-python -m run.main --config configs/methods/<method_name>.yaml run-test
+# Quick sanity check (single prompt)
+python -m run.main --config configs/methods/<method>.yaml run-test
 
-# Single-model benchmark (lane-based)
-python -m run.main --config configs/methods/<method_name>.yaml run-benchmark --benchmarks gsm8k --lane behavior --max-samples 20
-```
+# Single-model benchmark
+python -m run.main --config configs/methods/<method>.yaml \
+  run-benchmark --benchmarks gsm8k --lane behavior --max-samples 20
 
-Primary research workflows use `run-benchmark` and `run-benchmark-compare`.
-
-```bash
-# Accuracy/perf on canonical multiple-choice benchmarks (LL-based)
-python -m run.main \
-  --config configs/methods/subspec_sd_no_offload.yaml \
-  run-benchmark \
-  --benchmarks hellaswag,piqa,arc-c,winogrande \
-  --lane distribution \
-  --max-samples 200
-```
-
-```bash
-# Paired comparison on LL-only MC tasks (fp16 baseline vs Lossy-SD)
-python -m run.main \
-  --config configs/methods/subspec_sd_no_offload.yaml \
+# Paired comparison vs a baseline (add --reuse-baseline-dir <dir> to skip regenerating it)
+python -m run.main --config configs/methods/subspec_sd_no_offload.yaml \
   run-benchmark-compare \
-  --compare-config configs/methods/subspec_sd_lossy_no_offload.yaml \
-  --compare-name lossy_sd \
-  --benchmarks hellaswag,piqa,arc-c,winogrande \
-  --lane distribution \
-  --max-samples 200
+  --compare-config configs/methods/subspec_sd_lossy_no_offload.yaml --compare-name lossy_sd \
+  --benchmarks gsm8k,human-eval --lane behavior --max-samples 200
+
+# Sweep one base config over a matrix of override points (see configs/sweeps/)
+python -m run.main --config configs/methods/subspec_sd.yaml \
+  run-sweep --spec configs/sweeps/depth_temp.yaml --max-samples 20
 ```
 
-```bash
-# Paired behavior comparison on decode-dominant tasks (task-native acc + flips)
-python -m run.main \
-  --config configs/methods/subspec_sd_no_offload.yaml \
-  run-benchmark-compare \
-  --compare-config configs/methods/subspec_sd_lossy_no_offload.yaml \
-  --compare-name lossy_sd \
-  --benchmarks gsm8k,human-eval \
-  --lane behavior \
-  --max-samples 200
-```
+`--lane distribution` is for LL-only multiple-choice benchmarks (`hellaswag,piqa,arc-c,winogrande`);
+`--lane behavior` for decode-dominant tasks (`gsm8k,human-eval`). Each subcommand's flags: `--help`.
 
-MC benchmarks (`hellaswag,piqa,arc-c,winogrande`) are LL-only and use `--lane distribution`.
+See [BENCHMARKING.md](BENCHMARKING.md) for lane definitions, per-goal benchmark recommendations,
+the output schema, and flip/KL metric interpretation.
 
-```bash
-# Paired distribution comparison (fp16 baseline vs int4)
-python -m run.main \
-  --config configs/methods/subspec_sd_no_offload.yaml \
-  run-benchmark-compare \
-  --compare-config configs/methods/vanilla_int4.yaml \
-  --compare-name int4 \
-  --benchmarks hellaswag,piqa,arc-c,winogrande \
-  --lane distribution \
-  --max-samples 200
-```
+A sweep YAML declares `base` + `axes` (cartesian) + `include` (correlated bundles); each point is
+the base config plus its overrides, run as `run-benchmark`. `configs/sweeps/` has worked examples.
 
-```bash
-# Reuse a previous baseline directory (skip baseline regeneration)
-python -m run.main \
-  --config configs/methods/subspec_sd_no_offload.yaml \
-  run-benchmark-compare \
-  --compare-config configs/methods/vanilla_int4.yaml \
-  --benchmarks hellaswag,piqa,arc-c,winogrande \
-  --lane distribution \
-  --reuse-baseline-dir experiments/<timestamp>/run_benchmark_compare \
-  --max-samples 200
-```
-
-### Quick Examples
-
-**1. Evaluate behavior lane benchmarks on a specific GPU:**
-```bash
-python -m run.main --config configs/methods/subspec_sd.yaml --set device=cuda:0 run-benchmark --benchmarks gsm8k --lane behavior --max-samples 20
-```
-
-**2. Run a quick test with Classic SD on a different GPU:**
-```bash
-python -m run.main --config configs/methods/classic_sd.yaml --set device=cuda:1 --set warmup_iter=0 run-test
-```
-
-See [BENCHMARKING.md](BENCHMARKING.md) for:
-- lane definitions (`distribution` vs `behavior`)
-- benchmark recommendations per comparison goal
-- output schema and flip/KL metric interpretation
-
-> The datasets and pretrained models will be downloaded automatically from Hugging Face.
+> Datasets and pretrained models download automatically from Hugging Face.
 
 ## Results
 
