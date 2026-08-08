@@ -1,36 +1,13 @@
-# SubSpec SD (v1) + lossy verification
-method: subspec_sd_no_offload
-
-llm_path: meta-llama/Llama-3.1-8B-Instruct
-
-recipe:
-  class_path: specdecodes.helpers.recipes.subspec.hqq_4bit_no_offload:Recipe
-
-max_length: 4096
-cache_implementation: static
-warmup_iter: 1
-compile_mode: max-autotune
-
-# Target sampling settings (defaults)
-do_sample: false
-temperature: 0
-
-generator_profiling: true
-
-generator_kwargs:
-  prefill_chunk_size: 4096
-  verify_method: lossy
-  verify_kwargs:
-    # Threshold method: entropy (paper) or prob (probability).
-    threshold_method: entropy
-    # Entropy gate threshold (normalized entropy < threshold) when threshold_method=entropy.
-    # For threshold_method=prob, this is a probability threshold on the target distribution
-    # for accepting a non-matching draft child.
-    threshold: 0.3
-    # Require at least this many future locally-correct nodes (lookahead).
-    window_size: 6
+# SubSpec SD (v1, no offload) + lossy verification. Inherits subspec_sd_no_offload.yaml;
+# only draft depth and the verifier differ.
+extends: subspec_sd_no_offload.yaml
 
 draft_params:
-  temperature: 0.2
   max_depth: 48
-  topk_len: 6
+
+generator_kwargs:
+  verify_method: lossy
+  verify_kwargs:
+    threshold_method: entropy
+    threshold: 0.3
+    window_size: 6

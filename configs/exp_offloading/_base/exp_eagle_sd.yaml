@@ -1,0 +1,13 @@
+# exp_offloading eagle_sd base (no prefill_chunk_size in generator_kwargs).
+extends: exp_common.yaml
+method: eagle_sd
+seed: 0
+warmup_iter: 3
+compile_mode: max-autotune
+draft_params:
+  temperature: 1
+  max_depth: 6
+  topk_len: 10
+recipe:
+  class_path: specdecodes.helpers.recipes.offload.layer_offload:LayerOffloadRecipe
+  kwargs: {}

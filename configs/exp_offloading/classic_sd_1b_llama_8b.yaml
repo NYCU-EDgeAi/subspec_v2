@@ -1,30 +1,9 @@
-method: classic_sd
-vram_limit_gb: 8
-seed: 0
-device: cuda:0
-max_length: 4096
+# exp_offloading leaf (classic_sd); inherits _base/exp_classic_sd.yaml.
+extends: _base/exp_classic_sd.yaml
 
-llm_path: meta-llama/Llama-3.1-8B-Instruct
 draft_model_path: meta-llama/Llama-3.2-1B-Instruct
-
-do_sample: false
-temperature: 0
-
-generator_kwargs:
-  prefill_chunk_size: 256
-  verify_method: exact
-  verify_kwargs: {}
-
-draft_params:
-  temperature: 1
-  max_depth: 32
-  topk_len: 6
-
+llm_path: meta-llama/Llama-3.1-8B-Instruct
 recipe:
-  class_path: specdecodes.helpers.recipes.offload.layer_offload:LayerOffloadRecipe
   kwargs:
     keep_first_n_layers_on_gpu: 1
-
-cache_implementation: static
-warmup_iter: 3
-compile_mode: max-autotune
+vram_limit_gb: 8

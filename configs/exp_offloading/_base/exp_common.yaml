@@ -1,0 +1,11 @@
+# Shared base for the exp_offloading matrix. Not runnable on its own.
+# NOTE: prefill_chunk_size is intentionally NOT here (eagle omits it); the per-method
+# bases that use it add it.
+device: cuda:0
+max_length: 4096
+do_sample: false
+temperature: 0
+cache_implementation: static
+generator_kwargs:
+  verify_method: exact
+  verify_kwargs: {}

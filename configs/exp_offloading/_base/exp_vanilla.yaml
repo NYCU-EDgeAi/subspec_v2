@@ -1,0 +1,10 @@
+# exp_offloading vanilla base. Leaf sets llm_path, vram_limit_gb, recipe.kwargs.keep_first_n_layers_on_gpu.
+extends: exp_common.yaml
+method: vanilla
+warmup_iter: 1
+compile_mode: null
+generator_kwargs:
+  prefill_chunk_size: 256
+recipe:
+  class_path: specdecodes.helpers.recipes.offload.layer_offload:LayerOffloadRecipe
+  kwargs: {}

@@ -1,23 +1,8 @@
-method: vanilla
-vram_limit_gb: 8
-device: cuda:0
-max_length: 4096
+# exp_offloading leaf (vanilla); inherits _base/exp_vanilla.yaml.
+extends: _base/exp_vanilla.yaml
 
 llm_path: meta-llama/Llama-3.1-8B-Instruct
-
-do_sample: false
-temperature: 0
-
-generator_kwargs:
-  prefill_chunk_size: 256
-  verify_method: exact
-  verify_kwargs: {}
-
 recipe:
-  class_path: specdecodes.helpers.recipes.offload.layer_offload:LayerOffloadRecipe
   kwargs:
     keep_first_n_layers_on_gpu: 10
-
-cache_implementation: static
-warmup_iter: 1
-compile_mode: null
+vram_limit_gb: 8

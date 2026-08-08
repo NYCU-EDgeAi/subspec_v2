@@ -1,36 +1,12 @@
-# Classic tree-SD with lossy verification
-method: classic_sd
-
-llm_path: meta-llama/Llama-3.1-8B-Instruct
-draft_model_path: meta-llama/Llama-3.2-1B-Instruct
-
-recipe: null
+# Classic SD + lossy verification. Inherits classic_sd.yaml; only max_length and the
+# verifier differ.
+extends: classic_sd.yaml
 
 max_length: 2048
-cache_implementation: static
-warmup_iter: 1
-compile_mode: max-autotune
-
-# Target sampling settings (defaults)
-do_sample: false
-temperature: 0
-
-generator_profiling: true
 
 generator_kwargs:
-  prefill_chunk_size: 4096
   verify_method: lossy
   verify_kwargs:
-    # Threshold method: entropy (paper) or prob (probability).
     threshold_method: entropy
-    # Entropy gate threshold (normalized entropy < threshold) when threshold_method=entropy.
-    # For threshold_method=prob, this is a probability threshold on the target distribution
-    # for accepting a non-matching draft child.
     threshold: 0.3
-    # Require at least this many future locally-correct nodes (lookahead).
     window_size: 6
-
-draft_params:
-  temperature: 1.0
-  max_depth: 8
-  topk_len: 6
