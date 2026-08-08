@@ -472,6 +472,11 @@ class SubSpecSDDraftModel(DraftModelBase):
         
     @torch.no_grad()
     def postspec(self):
+        # Opt-in suspend hook: a caller can set `_suspend_postspec = True` to pause
+        # postspec (returns False, does no work, leaves postspec_count untouched).
+        # Defaults off, so no behavior change for the normal path.
+        if getattr(self, "_suspend_postspec", False):
+            return False
         if not self.had_first_speculate:
             return False
         if self.postspec_count > (self.draft_params.max_depth - 1):
